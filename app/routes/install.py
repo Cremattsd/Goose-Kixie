@@ -10,7 +10,7 @@ from ..services.kixie_api import create_or_update_webhook
 router = APIRouter()
 
 class InstallBody(BaseModel):
-    # All optional: falls back to .env if omitted
+    # Optional: fall back to .env if omitted
     name: str | None = None
     kixie_api_key: str | None = None
     kixie_business_id: str | None = None
@@ -21,15 +21,14 @@ def _resolve_defaults(body: InstallBody):
     apikey = body.kixie_api_key or os.getenv("KIXIE_API_KEY")
     bizid  = body.kixie_business_id or os.getenv("KIXIE_BUSINESS_ID")
     rn_jwt = body.realnex_jwt or os.getenv("REALNEX_JWT")
-
-    missing = [k for k, v in {
+    missing = [k for k,v in {
         "KIXIE_API_KEY": apikey,
         "KIXIE_BUSINESS_ID": bizid,
         "REALNEX_JWT": rn_jwt
     }.items() if not v]
     if missing:
         raise HTTPException(400, f"Missing creds: {', '.join(missing)}. "
-                                 "Supply in JSON body or set them in .env")
+                                 "Provide in JSON body or set them in .env")
     return name, apikey, bizid, rn_jwt
 
 @router.post("", summary="Install tenant and register Kixie webhooks (uses .env defaults)")
@@ -52,4 +51,31 @@ async def install(body: InstallBody, db: Session = Depends(get_db)):
     headers  = f"[{{\\\"name\\\":\\\"X-Goose-Secret\\\",\\\"value\\\":\\\"{secret}\\\"}}]"
 
     webhook_errors: list[str] = []
-    for event, w
+    for event, wname in [
+        ("endcall", "goose-endcall"),
+        ("disposition", "goose-disposition"),
+        ("sms", "goose-sms"),
+    ]:
+        payload = {
+            "call": "postWebhook",
+            "eventname": event,
+            "direction": "all",
+            "callresult": "all",
+            "disposition": "all",
+            "runtime": "realtime",
+            "name": wname,
+            "location": location,
+            "headers": headers
+        }
+        try:
+            await create_or_update_webhook(apikey, bizid, payload)
+        except Exception as e:
+            webhook_errors.append(f"{event}: {e}")
+
+    return {
+        "tenant_id": tenant.id,
+        "webhook_secret": secret,
+        "webhook_location": location,
+        "ok": len(webhook_errors) == 0,
+        "webhook_errors": webhook_errors
+    }

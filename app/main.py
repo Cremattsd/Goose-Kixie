@@ -1,3 +1,5 @@
+from dotenv import load_dotenv; load_dotenv()  # <- auto-load .env
+
 from fastapi import FastAPI
 from .services.db import init_db
 from .routes.install import router as install_router
@@ -8,6 +10,13 @@ app = FastAPI(title="Goose-Kixie")
 @app.on_event("startup")
 def startup():
     init_db()
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "routes": ["/health", "/docs", "/install", "/kixie/webhooks", "/kixie/lookup"]
+    }
 
 @app.get("/health")
 def health():
