@@ -1,5 +1,3 @@
-# app/routes/kixie.py
-
 import os, json, hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -36,17 +34,27 @@ def idem_key(tenant_id: int, callid: str | None, event: str) -> str:
     return hashlib.sha256(f"{tenant_id}|{callid or ''}|{event}".encode()).hexdigest()
 
 
+def _get_case_insensitive(d: dict, key: str):
+    """Return d[key] with case-insensitive lookup, else None."""
+    if not isinstance(d, dict):
+        return None
+    lower_map = {k.lower(): k for k in d.keys()}
+    real = lower_map.get(key.lower())
+    return d.get(real) if real else None
+
+
 def extract_contact_id(obj: Any) -> Optional[str]:
     if isinstance(obj, dict):
-        # common keys
-        for k in ("contactId", "contactID", "ContactId", "id", "key", "objectKey", "contactKey", "entityId", "entityKey"):
-            if k in obj and obj[k]:
-                return str(obj[k])
-        # nested result arrays
-        val = obj.get("value")
+        # case-insensitive search across common id keys
+        for k in ("contactId", "id", "key", "objectKey", "contactKey", "entityId", "entityKey"):
+            v = _get_case_insensitive(obj, k)
+            if v:
+                return str(v)
+        # nested "value" arrays
+        val = _get_case_insensitive(obj, "value")
         if isinstance(val, list) and val:
             for item in val:
-                et = str(item.get("entityType", "")).lower()
+                et = str(_get_case_insensitive(item, "entityType") or "").lower()
                 if "contact" in et:
                     cid = extract_contact_id(item)
                     if cid:
@@ -76,7 +84,7 @@ async def _find_or_create_contact(token: str, number_e164: str) -> dict:
         try:
             res_any = await search_any(token, number_e164)
             if isinstance(res_any, dict):
-                candidates = [x for x in res_any.get("value", []) if "contact" in str(x.get("entityType", "")).lower()]
+                candidates = [x for x in res_any.get("value", []) if "contact" in str(_get_case_insensitive(x, "entityType") or "").lower()]
         except Exception:
             candidates = []
 
@@ -134,9 +142,9 @@ async def lookup(
     return {
         "found": True,
         "contact": {
-            "first_name": str(contact.get("firstName", "")),
-            "last_name": str(contact.get("lastName", "")),
-            "email": str(contact.get("email", "")),
+            "first_name": str(_get_case_insensitive(contact, "firstName") or _get_case_insensitive(contact, "FirstName") or ""),
+            "last_name":  str(_get_case_insensitive(contact, "lastName")  or _get_case_insensitive(contact, "LastName")  or ""),
+            "email":      str(_get_case_insensitive(contact, "email")     or _get_case_insensitive(contact, "Email")     or ""),
             "phone_number": number,
             "contact_id": cid,
             "url": url,

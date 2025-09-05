@@ -1,5 +1,3 @@
-# app/services/realnex_api.py
-
 import os
 import httpx
 
@@ -89,7 +87,9 @@ async def search_contact_by_phone_odata(token: str, e164: str) -> dict:
     Returns {"status": <int>, "value": [...]}
     """
     variants = _normalize_phone_variants(e164)
-    fields = ["mobile", "home", "work", "fax"]  # per RN OData schema
+    # RN OData schema uses PascalCase
+    fields = ["Mobile", "Home", "Work", "Fax"]
+    select_cols = "Key,FirstName,LastName,Mobile,Home,Work,Email"
 
     # 1) equals (strongest)
     eq_parts: list[str] = []
@@ -101,7 +101,7 @@ async def search_contact_by_phone_odata(token: str, e164: str) -> dict:
         res = await _odata_get(
             "/Contacts",
             token,
-            _odata_params(fexpr, top=5, select="key,firstName,lastName,mobile,home,work,email"),
+            _odata_params(fexpr, top=5, select=select_cols),
         )
         if res.get("status", 500) < 400 and res.get("value"):
             return res
@@ -117,7 +117,7 @@ async def search_contact_by_phone_odata(token: str, e164: str) -> dict:
         res = await _odata_get(
             "/Contacts",
             token,
-            _odata_params(fexpr, top=5, select="key,firstName,lastName,mobile,home,work,email"),
+            _odata_params(fexpr, top=5, select=select_cols),
         )
         if res.get("status", 500) < 400 and res.get("value"):
             return res
