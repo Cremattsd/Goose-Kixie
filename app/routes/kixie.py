@@ -10,7 +10,9 @@ from ..services.db import get_db
 from ..models.tenant import Tenant
 from ..models.eventlog import EventLog
 from ..services.crypto import decrypt
-from ..services.realnex_api import search_any, get_contacts, create_contact, create_history
+from ..services.realnex_api import (
+    search_any, get_contacts, create_contact_by_number, create_history
+)
 
 router = APIRouter()
 
@@ -39,9 +41,9 @@ async def _find_or_create_contact(token: str, number_e164: str) -> dict:
             candidates = [x for x in res.get("value", []) if x.get("entityType","").lower()=="contact"]
         except Exception:
             candidates = []
-    # create if still nothing
+    # create if still nothing (robust helper handles RN validation quirks)
     if not candidates:
-        created = await create_contact(token, {"mobile": number_e164, "firstName": "", "lastName": "", "source": "kixie"})
+        created = await create_contact_by_number(token, number_e164)
         candidates = [created]
     return candidates[0]
 
