@@ -21,14 +21,16 @@ def _resolve_defaults(body: InstallBody):
     apikey = body.kixie_api_key or os.getenv("KIXIE_API_KEY")
     bizid  = body.kixie_business_id or os.getenv("KIXIE_BUSINESS_ID")
     rn_jwt = body.realnex_jwt or os.getenv("REALNEX_JWT")
-    missing = [k for k,v in {
+    missing = [k for k, v in {
         "KIXIE_API_KEY": apikey,
         "KIXIE_BUSINESS_ID": bizid,
         "REALNEX_JWT": rn_jwt
     }.items() if not v]
     if missing:
-        raise HTTPException(400, f"Missing creds: {', '.join(missing)}. "
-                                 "Provide in JSON body or set them in .env")
+        raise HTTPException(
+            400,
+            f"Missing creds: {', '.join(missing)}. Provide in JSON body or set them in .env"
+        )
     return name, apikey, bizid, rn_jwt
 
 @router.post("", summary="Install tenant and register Kixie webhooks (uses .env defaults)")
@@ -79,3 +81,17 @@ async def install(body: InstallBody, db: Session = Depends(get_db)):
         "ok": len(webhook_errors) == 0,
         "webhook_errors": webhook_errors
     }
+
+@router.get("/tenants", summary="List installed tenants")
+def list_tenants(db: Session = Depends(get_db)):
+    rows = db.query(Tenant).order_by(Tenant.id.desc()).all()
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "businessid": t.kixie_business_id,
+            "webhook_secret": t.webhook_secret,
+            "active": t.active,
+        }
+        for t in rows
+    ]
