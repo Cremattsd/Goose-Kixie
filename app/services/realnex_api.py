@@ -1,4 +1,5 @@
-import os
+# app/services/realnex_api.py
+import os, re
 import httpx
 
 BASE = os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm").rstrip("/")
@@ -8,9 +9,16 @@ ODATA_VERSION = os.getenv("RN_ODATA_VERSION", "1.0")
 # If BASE is .../api/v1/Crm we want .../api/v1 for OData
 ODATA_ROOT = BASE[:-4] if BASE.lower().endswith("/crm") else BASE
 
+# Optional env pins to make history deterministic
+RN_ODATA_HISTORY_SET = os.getenv("RN_ODATA_HISTORY_SET")  # e.g. "/Histories"
+RN_ODATA_HISTORY_DATE_FIELD = os.getenv("RN_ODATA_HISTORY_DATE_FIELD")  # e.g. "Date"
 
-def _headers(token: str, odata: bool = False) -> dict:
-    accept = "application/json;odata.metadata=minimal;odata.streaming=true" if odata else "application/json"
+
+def _headers(token: str, odata: bool = False, xml: bool = False) -> dict:
+    if xml:
+        accept = "application/xml"
+    else:
+        accept = "application/json;odata.metadata=minimal;odata.streaming=true" if odata else "application/json"
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -19,10 +27,6 @@ def _headers(token: str, odata: bool = False) -> dict:
 
 
 async def _safe_json(r: httpx.Response) -> dict:
-    """
-    RN sometimes 200/204 with no JSON; or 500 with empty text.
-    Return structured info without crashing.
-    """
     ct = (r.headers.get("content-type") or "").lower()
     body = (r.text or "").strip()
     okish = r.status_code < 400
@@ -61,6 +65,14 @@ async def _odata_get(path: str, token: str, params: dict | None = None) -> dict:
         return await _safe_json(r)
 
 
+async def _odata_post(path: str, token: str, payload: dict) -> dict:
+    q = {"api-version": ODATA_VERSION}
+    url = f"{ODATA_ROOT}/CrmOData{path}"
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post(url, headers=_headers(token, odata=True), params=q, json=payload)
+        return await _safe_json(r)
+
+
 # --------- OData helpers ---------
 
 def _odata_params(filter_expr: str, top: int = 5, select: str | None = None) -> dict:
@@ -81,32 +93,20 @@ def _normalize_phone_variants(e164: str) -> list[str]:
 
 
 async def search_contact_by_phone_odata(token: str, e164: str) -> dict:
-    """
-    OData search across likely contact phone fields on /CrmOData/Contacts.
-    Tries exact eq first, then contains() with last digits.
-    Returns {"status": <int>, "value": [...]}
-    """
     variants = _normalize_phone_variants(e164)
-    # RN OData schema uses PascalCase
     fields = ["Mobile", "Home", "Work", "Fax"]
     select_cols = "Key,FirstName,LastName,Mobile,Home,Work,Email"
 
-    # 1) equals (strongest)
     eq_parts: list[str] = []
     for fld in fields:
         for v in variants:
             eq_parts.append(f"{fld} eq '{v}'")
     if eq_parts:
         fexpr = " or ".join(eq_parts)
-        res = await _odata_get(
-            "/Contacts",
-            token,
-            _odata_params(fexpr, top=5, select=select_cols),
-        )
+        res = await _odata_get("/Contacts", token, _odata_params(fexpr, top=5, select=select_cols))
         if res.get("status", 500) < 400 and res.get("value"):
             return res
 
-    # 2) contains() (use last 7–10 digits)
     tails = [v for v in variants if len(v) >= 7][-2:] or variants[-1:]
     contains_parts: list[str] = []
     for fld in fields:
@@ -114,15 +114,22 @@ async def search_contact_by_phone_odata(token: str, e164: str) -> dict:
             contains_parts.append(f"contains({fld},'{v}')")
     if contains_parts:
         fexpr = " or ".join(contains_parts)
-        res = await _odata_get(
-            "/Contacts",
-            token,
-            _odata_params(fexpr, top=5, select=select_cols),
-        )
+        res = await _odata_get("/Contacts", token, _odata_params(fexpr, top=5, select=select_cols))
         if res.get("status", 500) < 400 and res.get("value"):
             return res
 
     return {"status": 404, "value": []}
+
+
+# --- OData metadata (for debugging) ---
+async def list_odata_entitysets(token: str) -> dict:
+    url = f"{ODATA_ROOT}/CrmOData/$metadata?api-version={ODATA_VERSION}"
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.get(url, headers=_headers(token, odata=True, xml=True))
+        status = r.status_code
+        text = r.text or ""
+        names = re.findall(r'EntitySet\s+Name="([^"]+)"', text) or re.findall(r'EntitySet Name="([^"]+)"', text)
+        return {"status": status, "sets": names, "raw": text[:2000]}
 
 
 # --------- REST searches (fallbacks) ---------
@@ -132,7 +139,7 @@ async def get_contacts(token: str, params: dict) -> dict:
         res = await _get_json(f"{BASE}{path}", token, params)
         if res.get("status", 500) < 400:
             return res
-    return res  # last result (error)
+    return res
 
 
 async def search_any(token: str, query: str) -> dict:
@@ -153,35 +160,67 @@ async def create_contact(token: str, contact: dict) -> dict:
     return res
 
 
-async def create_contact_by_number(token: str, number_e164: str) -> dict:
-    """Try two common shapes."""
-    attempt_a = {
-        "firstName": "Kixie",
-        "lastName": "Lead",
-        "mobile": number_e164,
-        "source": "kixie",
-    }
-    res = await create_contact(token, attempt_a)
-    if res.get("status", 500) < 400:
-        return res
-    attempt_b = {
-        "firstName": "Kixie",
-        "lastName": "Lead",
-        "source": "kixie",
-        "phones": [{"type": "Mobile", "phoneNumber": number_e164}],
-    }
-    return await create_contact(token, attempt_b)
+async def create_contact_by_number(
+    token: str,
+    number_e164: str,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    email: str | None = None,
+    company: str | None = None,
+) -> dict:
+    """
+    Create a contact with best-available detail.
+    Sends both camelCase and PascalCase variants; tries 'phones' array shape too.
+    """
+    number_tail = "".join(ch for ch in number_e164 if ch.isdigit())[-4:] or number_e164[-4:]
+    fn = (first_name or "").strip() or "Unknown"
+    ln = (last_name  or "").strip() or f"Caller {number_tail}"
+    em = (email or "").strip() or None
+    co = (company or "").strip() or None
+
+    def _clean(d: dict) -> dict:
+        return {k: v for k, v in d.items() if v is not None and v != ""}
+
+    payloads = [
+        _clean({
+            "firstName": fn,
+            "lastName": ln,
+            "mobile": number_e164,
+            "email": em,
+            "company": co,
+            "source": "kixie",
+        }),
+        _clean({
+            "FirstName": fn,
+            "LastName": ln,
+            "Mobile": number_e164,
+            "Email": em,
+            "Company": co,
+            "Source": "kixie",
+        }),
+        _clean({
+            "firstName": fn,
+            "lastName": ln,
+            "phones": [{"type": "Mobile", "phoneNumber": number_e164}],
+            "email": em,
+            "source": "kixie",
+            "company": co,
+        }),
+    ]
+
+    last = {}
+    for p in payloads:
+        res = await create_contact(token, p)
+        if res.get("status", 500) < 400:
+            return res
+        last = res
+    return last
 
 
-async def create_history(token: str, history: dict, contact_id: str | None = None) -> dict:
-    """
-    Try across:
-      Bases: BASE, BASE(without /Crm)  e.g. …/api/v1/Crm and …/api/v1
-      Paths: nested & top-level (case variants)
-    """
+async def create_history_rest(token: str, history: dict, contact_id: str | None = None) -> dict:
     roots = [BASE]
     if BASE.lower().endswith("/crm"):
-        roots.append(BASE[:-4])  # strip '/Crm'
+        roots.append(BASE[:-4])
     else:
         roots.append(f"{BASE}/Crm")
 
@@ -199,5 +238,43 @@ async def create_history(token: str, history: dict, contact_id: str | None = Non
             res = await _post_json(url, token, history)
             if res.get("status", 500) < 400:
                 return res
-            last = res
-    return last  # error result
+            last = {"attempt": url, **res}
+    return last
+
+
+async def create_history_odata(token: str, subject: str, note: str, date_iso: str, contact_id: str, event_type_key: str | None) -> dict:
+    """
+    Create History via OData entity sets. Try env-pinned set/field first, else common fallbacks.
+    """
+    common = {"Subject": subject, "Title": subject, "Description": note, "Note": note, "ContactKey": contact_id}
+    if event_type_key:
+        common["EventTypeKey"] = event_type_key
+        common["eventTypeKey"] = event_type_key
+
+    # First: try pinned env set/field if provided
+    if RN_ODATA_HISTORY_SET and RN_ODATA_HISTORY_DATE_FIELD:
+        payload = dict(common)
+        payload[RN_ODATA_HISTORY_DATE_FIELD] = date_iso
+        res = await _odata_post(RN_ODATA_HISTORY_SET, token, payload)
+        if res.get("status", 500) < 400:
+            return res
+
+    # Otherwise: try common sets and date fields
+    sets = ["/Histories", "/ContactHistories", "/Activities", "/Notes", "/ActivityHistories", "/ContactNotes"]
+    date_fields = ["Date", "ActivityDate", "EventDate", "CreatedOn"]
+
+    last = {}
+    for s in sets:
+        for df in date_fields:
+            payload = dict(common)
+            payload[df] = date_iso
+            res = await _odata_post(s, token, payload)
+            if res.get("status", 500) < 400:
+                return res
+            last = {"attempt": f"{ODATA_ROOT}/CrmOData{s}", "payload_keys": list(payload.keys()), **res}
+    return last
+
+
+async def create_history(token: str, history: dict, contact_id: str | None = None) -> dict:
+    # Legacy fallback used by router if OData fails
+    return await create_history_rest(token, history, contact_id)

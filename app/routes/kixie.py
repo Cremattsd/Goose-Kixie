@@ -1,3 +1,4 @@
+# app/routes/kixie.py
 import os, json, hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -14,8 +15,10 @@ from ..services.realnex_api import (
     search_any,
     get_contacts,
     create_contact_by_number,
-    create_history,
+    create_history,  # legacy REST fallback
     search_contact_by_phone_odata,
+    list_odata_entitysets,
+    create_history_odata,  # OData first
 )
 
 router = APIRouter()
@@ -35,7 +38,6 @@ def idem_key(tenant_id: int, callid: str | None, event: str) -> str:
 
 
 def _get_case_insensitive(d: dict, key: str):
-    """Return d[key] with case-insensitive lookup, else None."""
     if not isinstance(d, dict):
         return None
     lower_map = {k.lower(): k for k in d.keys()}
@@ -45,12 +47,10 @@ def _get_case_insensitive(d: dict, key: str):
 
 def extract_contact_id(obj: Any) -> Optional[str]:
     if isinstance(obj, dict):
-        # case-insensitive search across common id keys
-        for k in ("contactId", "id", "key", "objectKey", "contactKey", "entityId", "entityKey"):
+        for k in ("contactId", "id", "key", "objectKey", "contactKey", "entityId", "entityKey", "Key"):
             v = _get_case_insensitive(obj, k)
             if v:
                 return str(v)
-        # nested "value" arrays
         val = _get_case_insensitive(obj, "value")
         if isinstance(val, list) and val:
             for item in val:
@@ -63,15 +63,50 @@ def extract_contact_id(obj: Any) -> Optional[str]:
     return None
 
 
-async def _find_or_create_contact(token: str, number_e164: str) -> dict:
-    # 0) OData phone search (preferred)
+def _extract_name_company_email(d: dict) -> tuple[tuple[str | None, str | None, str | None], str | None]:
+    """
+    Heuristics across likely Kixie keys.
+    Returns ((first_name, last_name, email), company)
+    """
+    def gi(*keys):
+        for k in keys:
+            if k in d and d[k]:
+                return str(d[k]).strip()
+            lk = {kk.lower(): kk for kk in d.keys()}
+            real = lk.get(k.lower())
+            if real and d.get(real):
+                return str(d[real]).strip()
+        return None
+
+    full = gi("customername","customer_name","contactname","contact_name","name","full_name","fullname","displayname")
+    fn   = gi("firstname","first_name","first")
+    ln   = gi("lastname","last_name","last")
+    email= gi("email","customeremail","customer_email")
+
+    if full and not (fn and ln):
+        parts = [p for p in full.replace(",", " ").split() if p]
+        if len(parts) == 1:
+            fn = fn or parts[0]
+        elif len(parts) >= 2:
+            fn = fn or parts[0]
+            ln = ln or " ".join(parts[1:])
+    company = gi("company","companyname","organization","account","accountname")
+
+    return (fn, ln, email or None), company
+
+
+async def _find_or_create_contact(
+    token: str,
+    number_e164: str,
+    name_email_hint: tuple[str | None, str | None, str | None] | None = None,
+    company_hint: str | None = None
+) -> dict:
     try:
         res = await search_contact_by_phone_odata(token, number_e164)
         candidates = res.get("value", []) if isinstance(res, dict) else []
     except Exception:
         candidates = []
 
-    # 1) legacy direct search (belt & suspenders)
     if not candidates:
         try:
             res = await get_contacts(token, {"q": number_e164})
@@ -79,7 +114,6 @@ async def _find_or_create_contact(token: str, number_e164: str) -> dict:
         except Exception:
             candidates = []
 
-    # 2) global search fallback (filters to contacts)
     if not candidates:
         try:
             res_any = await search_any(token, number_e164)
@@ -88,15 +122,22 @@ async def _find_or_create_contact(token: str, number_e164: str) -> dict:
         except Exception:
             candidates = []
 
-    # 3) create if still none
     if not candidates:
-        created = await create_contact_by_number(token, number_e164)
+        fn, ln, em = name_email_hint or (None, None, None)
+        created = await create_contact_by_number(
+            token,
+            number_e164,
+            first_name=fn,
+            last_name=ln,
+            email=em,
+            company=company_hint
+        )
         candidates = [created] if isinstance(created, dict) else []
 
     return candidates[0] if candidates else {}
 
 
-def resolve_event_type_key(event: str) -> str:
+def resolve_event_type_key(event: str) -> Optional[str]:
     ev = (event or "").lower()
     key = None
     if ev == "endcall":
@@ -106,9 +147,7 @@ def resolve_event_type_key(event: str) -> str:
     elif ev == "sms":
         key = os.getenv("RN_EVENTTYPEKEY_SMS")
     key = key or os.getenv("RN_EVENTTYPEKEY_DEFAULT")
-    if not key:
-        raise HTTPException(500, "Missing RN_EVENTTYPEKEY_* in environment (.env)")
-    return str(key)
+    return str(key) if key else None
 
 
 # ---------- models ----------
@@ -152,6 +191,19 @@ async def lookup(
     }
 
 
+@router.get("/odata/sets", summary="List RN OData entity sets for this tenant")
+async def odata_sets(
+    businessid: str = Query(None),
+    db: Session = Depends(get_db),
+):
+    tenant = db.query(Tenant).first() if not businessid else find_tenant(db, businessid)
+    if not tenant:
+        raise HTTPException(404, "No tenant configured")
+    rn_token = decrypt(tenant.rn_jwt_enc)
+    sets = await list_odata_entitysets(rn_token)
+    return sets
+
+
 @router.post("/webhooks", summary="Kixie → Goose webhook (validated)")
 async def webhooks(
     body: WebhookBody,
@@ -180,10 +232,17 @@ async def webhooks(
             or body.data.get("tonumber")
             or ""
         )
+        num = str(num).strip()
         if not num:
             raise HTTPException(400, "No phone number in payload")
 
-        contact = await _find_or_create_contact(rn_token, num)
+        name_email_hint, company_hint = _extract_name_company_email(body.data)
+        contact = await _find_or_create_contact(
+            rn_token,
+            num,
+            name_email_hint=name_email_hint,
+            company_hint=company_hint
+        )
         cid = extract_contact_id(contact)
         if not cid:
             raise HTTPException(
@@ -210,49 +269,49 @@ async def webhooks(
             parts.append(f"Agent: {agent}")
         note = " | ".join(parts) if parts else body.hookevent
 
-        et_key = resolve_event_type_key(body.hookevent)
+        fn, ln, _ = name_email_hint
+        friendly = " ".join([x for x in [fn, ln] if x])
+        if friendly:
+            note = f"{friendly} | {note}"
+
+        subject = f"Kixie {body.hookevent}"
         now = datetime.now(timezone.utc).isoformat()
+        et_key = resolve_event_type_key(body.hookevent)
 
-        # Try multiple payload shapes & entityType casings (some tenants are picky)
-        candidates: list[dict] = []
-        common = {
-            "note": note,
-            "description": note,
-            "subject": f"Kixie {body.hookevent}",
-            "title": f"Kixie {body.hookevent}",
-            "date": now,
-            "EventTypeKey": et_key,
-            "eventTypeKey": et_key,
-        }
-        for et in ("Contact", "crm.contact", "CrmContact"):
-            candidates.append(dict(common, entityType=et, entityId=cid))
-            candidates.append(dict(common, entityType=et, entityKey=cid))
+        # ---- OData-first: create History via OData entity set ----
+        res = await create_history_odata(rn_token, subject, note, now, cid, et_key)
+        if res.get("status", 500) >= 400:
+            # ---- Fallback to legacy REST fanout ----
+            common = {
+                "note": note,
+                "description": note,
+                "subject": subject,
+                "title": subject,
+                "date": now,
+            }
+            if et_key:
+                common["EventTypeKey"] = et_key
+                common["eventTypeKey"] = et_key
 
-        errors: list[str] = []
-        success = None
-        for payload in candidates:
-            res = await create_history(rn_token, payload, cid)
-            if res.get("status", 500) < 400:
-                success = res
-                break
-            else:
-                errors.append(
-                    f"{payload.get('entityType')}|{('entityId' if 'entityId' in payload else 'entityKey')} -> {res.get('error')}"
-                )
+            candidates: list[dict] = []
+            for et in ("Contact", "crm.contact", "CrmContact"):
+                candidates.append(dict(common, entityType=et, entityId=cid))
+                candidates.append(dict(common, entityType=et, entityKey=cid))
 
-        if not success:
-            # last resort: strip subject/title and try again quickly
-            for payload in candidates[:2]:
-                payload2 = {k: v for k, v in payload.items() if k not in ("subject", "title")}
-                res = await create_history(rn_token, payload2, cid)
-                if res.get("status", 500) < 400:
-                    success = res
+            errors: list[str] = []
+            success = None
+            for payload in candidates:
+                r2 = await create_history(rn_token, payload, cid)
+                if r2.get("status", 500) < 400:
+                    success = r2
                     break
                 else:
-                    errors.append(f"no-subject/title -> {res.get('error')}")
+                    errors.append(
+                        f"{payload.get('entityType')}|{('entityId' if 'entityId' in payload else 'entityKey')} -> {r2.get('error')} (via {r2.get('attempt','')})"
+                    )
 
-        if not success:
-            raise HTTPException(502, "RealNex History rejected all payloads: " + "; ".join(errors))
+            if not success:
+                raise HTTPException(502, "RealNex History rejected all payloads: " + "; ".join(errors))
 
     except Exception as e:
         status, error = "error", str(e)
