@@ -1,19 +1,16 @@
+# app/services/db.py
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./goose_kixie.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./goose.db")
 
-# SQLite note: for multi-process use, better move to Postgres in prod
-engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
-def init_db():
-    from ..models.tenant import Tenant
-    from ..models.mappings import UserMap, DispoMap
-    from ..models.eventlog import EventLog
-    Base.metadata.create_all(bind=engine)
 
 def get_db():
     db = SessionLocal()
@@ -21,3 +18,11 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def init_db():
+    # Import models so SQLAlchemy knows them
+    from ..models.tenant import Tenant  # existing in your repo
+    from ..models.mappings import UserMap, DispoMap  # existing in your repo
+    from ..models.eventlog import EventLog  # existing in your repo
+    from ..models.dialer_queue import DialerQueue  # new
+    Base.metadata.create_all(bind=engine)

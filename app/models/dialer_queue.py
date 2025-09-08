@@ -1,6 +1,6 @@
-from datetime import datetime
+# app/models/dialer_queue.py
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, ForeignKey, Index, func, UniqueConstraint
+    Column, Integer, String, DateTime, ForeignKey, Index, func, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from .tenant import Tenant
@@ -10,7 +10,7 @@ class DialerQueue(Base):
     __tablename__ = "dialer_queue"
 
     id = Column(Integer, primary_key=True)
-    tenant_id = Column(Integer, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
 
     campaign = Column(String(120), nullable=True)
     object_key = Column(String(64), nullable=False)  # RealNex Contact Key (GUID)

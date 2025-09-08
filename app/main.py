@@ -1,17 +1,9 @@
-# app/main.py
 from dotenv import load_dotenv; load_dotenv()
 
 from fastapi import FastAPI
-from .services.db import init_db
-from .routes.install import router as install_router
-from .routes.kixie import router as kixie_router
-from .routes.dialer import router as dialer_router  # ensure this file exists
+from .routes.dialer import router as dialer_router
 
-app = FastAPI(title="Goose-Kixie")
-
-@app.on_event("startup")
-def startup():
-    init_db()
+app = FastAPI(title="Goose-Kixie (RealNex wired)")
 
 @app.get("/")
 def root():
@@ -19,15 +11,11 @@ def root():
         "ok": True,
         "routes": [
             "/health",
-            "/docs",
-            "/install",
-            "/install/tenants",
-            "/kixie/webhooks",
-            "/kixie/lookup",
-            "/kixie/odata/sets",
-            "/dialer/queue/sync",
-            "/dialer/queue/bulk",
-            "/dialer/next",
+            "/webhooks/kixie",
+            "/activities/call",
+            "/contacts/search",
+            "/contacts",
+            "/kixie/lists/push",
         ],
     }
 
@@ -35,6 +23,4 @@ def root():
 def health():
     return {"ok": True}
 
-app.include_router(install_router, prefix="/install", tags=["install"])
-app.include_router(kixie_router,   prefix="/kixie",   tags=["kixie"])
-app.include_router(dialer_router,  prefix="/dialer",  tags=["dialer"])
+app.include_router(dialer_router, tags=["dialer"])

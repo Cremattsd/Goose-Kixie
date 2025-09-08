@@ -1,296 +1,208 @@
-import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+# app/routes/dialer.py
+from fastapi import APIRouter, Request, HTTPException, Query
+from pydantic import BaseModel
+import os, hmac, hashlib, json
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
-from sqlalchemy import and_
-
-from ..services.db import get_db
-from ..models.tenant import Tenant
-from ..models.dialer_queue import DialerQueue
-from ..services.crypto import decrypt
-from ..services import realnex_api as rn
+from ..services.realnex_api import (
+    normalize_phone_e164ish,
+    search_by_phone,
+    create_contact,
+    create_activity,
+)
 
 router = APIRouter()
 
-# ---------- helpers ----------
-def find_tenant(db: Session, business_id: Optional[str]) -> Tenant:
-    q = db.query(Tenant).filter(Tenant.active == True)
-    if business_id:
-        q = q.filter(Tenant.kixie_business_id == business_id)
-    t = q.order_by(Tenant.id.desc()).first()
-    if not t:
-        raise HTTPException(404, "No active tenant")
-    return t
+# ---------- Models ----------
+class CallActivity(BaseModel):
+    contact_id: Optional[str] = None
+    company_id: Optional[str] = None
+    agent_email: str
+    direction: str            # inbound|outbound
+    disposition: str          # answered|voicemail|missed|busy|etc
+    duration_sec: int
+    started_at: str           # ISO8601
+    ended_at: str             # ISO8601
+    notes: Optional[str] = None
+    recording_url: Optional[str] = None
+    from_number: Optional[str] = None
+    to_number: Optional[str] = None
+    call_id: Optional[str] = None
 
-def first_phone(contact: Dict[str, Any]) -> Optional[str]:
-    # Accept both PascalCase and camelCase keys
-    def g(k: str):
-        return contact.get(k) or contact.get(k[:1].lower() + k[1:]) or contact.get(k.upper()) or contact.get(k.lower())
-    for k in ("Mobile", "Work", "Home"):
-        v = g(k)
-        if v:
-            return str(v).strip()
+class PushListBody(BaseModel):
+    list_name: str
+    contacts: list[dict]
+
+class CreateContactBody(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
+
+# ---------- Health ----------
+@router.get("/health")
+def health():
+    return {"ok": True, "service": "goose-kixie-realnex"}
+
+# ---------- Signature ----------
+def _verify_kixie_signature(raw: bytes, header_sig: Optional[str]) -> None:
+    secret = os.getenv("KIXIE_WEBHOOK_SECRET")
+    if not secret:
+        return  # signature not enforced if secret isn't set
+    if not header_sig:
+        raise HTTPException(status_code=401, detail="Missing signature")
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, header_sig):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+# ---------- Utility: ensure ContactId (search → create) ----------
+async def _ensure_contact_id(rn_token: str, phone_raw: Optional[str]) -> Optional[str]:
+    phone = normalize_phone_e164ish(phone_raw) if phone_raw else None
+    if not phone:
+        return None
+
+    # 1) search by phone
+    found = await search_by_phone(rn_token, phone)
+    if (found.get("status") == 200) and found.get("data") or found.get("value") or found.get("items"):
+        # normalize possible shapes; prefer first id-like field
+        candidates = found.get("data") or found.get("value") or found.get("items") or []
+        first = candidates[0] if isinstance(candidates, list) and candidates else None
+        if isinstance(first, dict):
+            for key in ("Id","id","ContactId","contactId","Key","key"):
+                if key in first:
+                    return str(first[key])
+
+    # 2) quick-create if not found
+    created = await create_contact(rn_token, {
+        "FirstName": "",
+        "LastName": "",
+        "PrimaryPhone": phone,
+        "Source": "Kixie Auto-Create",
+    })
+    if created.get("status") in (200,201):
+        for key in ("Id","id","ContactId","contactId","Key","key"):
+            if key in created:
+                return str(created[key])
+        # sometimes payload returns in 'data'
+        data = created.get("data") or {}
+        for key in ("Id","id","ContactId","contactId","Key","key"):
+            if key in data:
+                return str(data[key])
     return None
 
-_e164 = re.compile(r"^\+?\d[\d\-\.\s\(\)]*$")
-def normalize_e164(num: str) -> Optional[str]:
-    if not num: return None
-    num = num.strip()
-    if not _e164.match(num):
-        return None
-    digits = re.sub(r"[^\d]", "", num)
-    if not digits:
-        return None
-    if digits.startswith("1") and len(digits) == 11:
-        return f"+{digits}"
-    if len(digits) == 10:
-        return f"+1{digits}"
-    if num.startswith("+"):
-        return f"+{digits}"
-    # fallback: assume already E.164 digits with country
-    return f"+{digits}" if digits else None
-
-def name_parts(contact: Dict[str, Any]) -> tuple[str, str]:
-    def g(k: str):
-        return contact.get(k) or contact.get(k[:1].lower() + k[1:]) or contact.get(k.upper()) or contact.get(k.lower())
-    return (g("FirstName") or "", g("LastName") or "")
-
-def get_company(contact: Dict[str, Any]) -> str:
-    for k in ("Company", "company", "Employer", "employer"):
-        if contact.get(k):
-            return str(contact[k])
-    return ""
-
-def get_email(contact: Dict[str, Any]) -> str:
-    for k in ("Email","email"):
-        if contact.get(k):
-            return str(contact[k])
-    return ""
-
-def do_not_call(contact: Dict[str, Any]) -> bool:
-    for k in ("DoNotCall","doNotCall","donotcall"):
-        if contact.get(k) is True:
-            return True
-    return False
-
-def contact_key(contact: Dict[str, Any]) -> Optional[str]:
-    for k in ("Key","key","objectKey","contactKey","id","Id","ID"):
-        if contact.get(k):
-            return str(contact[k])
-    return None
-
-def crm_url_from_key(key: str) -> str:
-    return f"https://crm.realnex.com/Contact/{key}"
-
-# ---------- schemas ----------
-class SyncBody(BaseModel):
-    campaign: Optional[str] = Field(None, description="Campaign label (optional).")
-    max_rows: int = Field(500, ge=1, le=5000, description="Max rows to pull from OData.")
-    # Optional: custom OData filter if you want to override defaults
-    odata_filter: Optional[str] = Field(None, description="Raw $filter to use instead of default.")
-
-class BulkItem(BaseModel):
-    object_key: str
-    phone_e164: str
-    name_first: Optional[str] = ""
-    name_last: Optional[str] = ""
-    company: Optional[str] = ""
-    email: Optional[str] = ""
-
-class BulkBody(BaseModel):
-    campaign: Optional[str] = None
-    items: List[BulkItem]
-
-# ---------- routes ----------
-@router.post("/queue/sync")
-async def sync_queue(
-    body: SyncBody,
-    businessid: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    tenant = find_tenant(db, businessid)
-    token = decrypt(tenant.rn_jwt_enc)
-
-    # Build OData query
-    select = "Key,FirstName,LastName,Company,Mobile,Work,Home,Email,DoNotCall"
-    if body.odata_filter:
-        filt = body.odata_filter
+# ---------- Webhook (Kixie → Goose) ----------
+@router.post("/webhooks/kixie")
+async def kixie_webhook(request: Request):
+    rn_token = os.getenv("REALNEX_TOKEN","")
+    if not rn_token:
+        # We still accept, but only echo/dry-run
+        dry_run = True
     else:
-        # default: not DNC and has any phone
-        filt = "(DoNotCall eq false) and ((Mobile ne null) or (Work ne null) or (Home ne null))"
+        dry_run = False
 
-    pulled = 0
-    upserted = 0
-    skipped = 0
+    raw = await request.body()
+    _verify_kixie_signature(raw, request.headers.get("X-Kixie-Signature"))
+    payload = json.loads(raw.decode("utf-8"))
 
-    async for page in rn.odata_contacts_iter(token, select=select, filter=filt, top=200, max_rows=body.max_rows):
-        for c in page:
-            if do_not_call(c):
-                skipped += 1
-                continue
-            num = first_phone(c)
-            phone = normalize_e164(num or "")
-            if not phone:
-                skipped += 1
-                continue
-            key = contact_key(c)
-            if not key:
-                skipped += 1
-                continue
-            first, last = name_parts(c)
-            company = get_company(c)
-            email = get_email(c)
+    # Determine which number is the "customer" based on direction
+    direction = payload.get("direction","outbound")
+    from_number = payload.get("from_number")
+    to_number   = payload.get("to_number")
+    customer_num = to_number if direction == "outbound" else from_number
 
-            # upsert
-            item = (
-                db.query(DialerQueue)
-                .filter(
-                    DialerQueue.tenant_id == tenant.id,
-                    DialerQueue.object_key == key,
-                    DialerQueue.campaign.is_(body.campaign) if body.campaign is None
-                    else DialerQueue.campaign == body.campaign
-                ).first()
-            )
-            if item:
-                item.name_first = first or item.name_first
-                item.name_last  = last  or item.name_last
-                item.company    = company or item.company
-                item.email      = email or item.email
-                item.phone_e164 = phone or item.phone_e164
-            else:
-                item = DialerQueue(
-                    tenant_id = tenant.id,
-                    campaign  = body.campaign,
-                    object_key = key,
-                    name_first = first,
-                    name_last  = last,
-                    company    = company,
-                    phone_e164 = phone,
-                    email      = email,
-                    status     = "pending"
-                )
-                db.add(item)
-                upserted += 1
-            pulled += 1
-        db.commit()
-
-    return {"ok": True, "pulled": pulled, "added_or_updated": upserted, "skipped": skipped, "campaign": body.campaign}
-
-@router.post("/queue/bulk")
-def bulk_seed(
-    body: BulkBody,
-    businessid: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    tenant = find_tenant(db, businessid)
-    added = 0
-    updated = 0
-    for it in body.items:
-        phone = normalize_e164(it.phone_e164)
-        if not phone:
-            continue
-        item = (
-            db.query(DialerQueue)
-            .filter(
-                DialerQueue.tenant_id == tenant.id,
-                DialerQueue.object_key == it.object_key,
-                DialerQueue.campaign.is_(body.campaign) if body.campaign is None
-                else DialerQueue.campaign == body.campaign
-            ).first()
-        )
-        if item:
-            item.name_first = it.name_first or item.name_first
-            item.name_last  = it.name_last  or item.name_last
-            item.company    = it.company    or item.company
-            item.email      = it.email      or item.email
-            item.phone_e164 = phone         or item.phone_e164
-            updated += 1
-        else:
-            db.add(DialerQueue(
-                tenant_id = tenant.id,
-                campaign  = body.campaign,
-                object_key = it.object_key,
-                name_first = it.name_first,
-                name_last  = it.name_last,
-                company    = it.company,
-                phone_e164 = phone,
-                email      = it.email,
-                status     = "pending"
-            ))
-            added += 1
-    db.commit()
-    return {"ok": True, "added": added, "updated": updated}
-
-class NextOut(BaseModel):
-    id: int
-    contact_key: str
-    name: str
-    company: str | None = None
-    phone: str
-    email: str | None = None
-    crm_url: str
-
-@router.get("/next", response_model=NextOut)
-def next_contact(
-    businessid: Optional[str] = Query(None),
-    agent: str = Query(..., description="Agent identifier (email)"),
-    campaign: Optional[str] = Query(None),
-    lock_ttl_sec: int = Query(120, ge=30, le=600),
-    db: Session = Depends(get_db)
-):
-    tenant = find_tenant(db, businessid)
-
-    # release expired locks
-    now = datetime.now(timezone.utc)
-    ttl_cutoff = now - timedelta(seconds=lock_ttl_sec)
-    expired = (
-        db.query(DialerQueue)
-        .filter(
-            DialerQueue.tenant_id == tenant.id,
-            DialerQueue.status == "locked",
-            DialerQueue.locked_at < ttl_cutoff
-        ).all()
+    # Build activity
+    activity = CallActivity(
+        agent_email=payload.get("agent_email","unknown@realnex.com"),
+        direction=direction,
+        disposition=payload.get("disposition","unknown"),
+        duration_sec=int(payload.get("duration_sec",0)),
+        started_at=payload.get("started_at",""),
+        ended_at=payload.get("ended_at",""),
+        notes=f"Kixie event {payload.get('event')} (auto-logged)",
+        recording_url=payload.get("recording_url"),
+        from_number=from_number,
+        to_number=to_number,
+        call_id=payload.get("call_id"),
     )
-    for r in expired:
-        r.status = "pending"
-        r.locked_by = None
-        r.locked_at = None
-    if expired:
-        db.commit()
 
-    # pick next pending
-    q = (
-        db.query(DialerQueue)
-        .filter(
-            DialerQueue.tenant_id == tenant.id,
-            DialerQueue.status == "pending"
-        )
-    )
-    if campaign is None:
-        q = q.filter(DialerQueue.campaign.is_(None))
-    else:
-        q = q.filter(DialerQueue.campaign == campaign)
+    # Resolve / create Contact
+    contact_id = None
+    if not dry_run:
+        contact_id = await _ensure_contact_id(rn_token, customer_num)
+    activity.contact_id = contact_id
 
-    item = q.order_by(DialerQueue.attempts.asc(), DialerQueue.created_at.asc()).first()
-    if not item:
-        raise HTTPException(404, "No pending records")
+    if dry_run:
+        return {
+            "status": "dry-run",
+            "reason": "REALNEX_TOKEN not set",
+            "activity": activity.model_dump(),
+        }
 
-    item.status = "locked"
-    item.locked_by = agent
-    item.locked_at = now
-    db.commit()
-    db.refresh(item)
+    # Create RealNex Activity
+    resp = await create_activity(rn_token, {
+        "Subject": f"Call {activity.direction} - {activity.disposition}",
+        "Notes": activity.notes,
+        "DurationSeconds": activity.duration_sec,
+        "StartedAt": activity.started_at,
+        "EndedAt": activity.ended_at,
+        "ContactId": activity.contact_id,
+        "CompanyId": activity.company_id,   # optional
+        "OwnerEmail": activity.agent_email,
+        "ExternalId": activity.call_id,     # helpful for idempotency
+        "Source": "Kixie",
+    })
 
-    full_name = " ".join([p for p in [item.name_first or "", item.name_last or ""] if p]).strip() or "Unknown"
-    return NextOut(
-        id=item.id,
-        contact_key=item.object_key,
-        name=full_name,
-        company=item.company,
-        phone=item.phone_e164,
-        email=item.email,
-        crm_url=crm_url_from_key(item.object_key)
-    )
+    return {"status": resp.get("status"), "realnex": resp, "activity": activity.model_dump()}
+
+# ---------- Manual call log (Goose → RealNex) ----------
+@router.post("/activities/call")
+async def log_call(activity: CallActivity):
+    rn_token = os.getenv("REALNEX_TOKEN","")
+    if not rn_token:
+        return {"status":"dry-run","reason":"REALNEX_TOKEN not set","activity":activity.model_dump()}
+    resp = await create_activity(rn_token, {
+        "Subject": f"Call {activity.direction} - {activity.disposition}",
+        "Notes": activity.notes,
+        "DurationSeconds": activity.duration_sec,
+        "StartedAt": activity.started_at,
+        "EndedAt": activity.ended_at,
+        "ContactId": activity.contact_id,
+        "CompanyId": activity.company_id,
+        "OwnerEmail": activity.agent_email,
+        "ExternalId": activity.call_id,
+        "Source": "Kixie",
+    })
+    return {"status": resp.get("status"), "realnex": resp}
+
+# ---------- Pass-through helpers ----------
+@router.get("/contacts/search")
+async def contacts_search(phone: str = Query(..., description="E.164 or raw; normalized in server")):
+    rn_token = os.getenv("REALNEX_TOKEN","")
+    if not rn_token:
+        return {"status":"dry-run","reason":"REALNEX_TOKEN not set"}
+    norm = normalize_phone_e164ish(phone)
+    return await search_by_phone(rn_token, norm or phone)
+
+@router.post("/contacts")
+async def contacts_create(body: CreateContactBody):
+    rn_token = os.getenv("REALNEX_TOKEN","")
+    if not rn_token:
+        return {"status":"dry-run","reason":"REALNEX_TOKEN not set"}
+    payload = {
+        "FirstName": body.first_name or "",
+        "LastName": body.last_name or "",
+        "Email": body.email or None,
+        "PrimaryPhone": normalize_phone_e164ish(body.phone) if body.phone else None,
+        "Company": body.company or None,
+        "Source": "Goose",
+    }
+    # prune None
+    payload = {k:v for k,v in payload.items() if v is not None}
+    return await create_contact(rn_token, payload)
+
+# ---------- Kixie power dialer (stub for now) ----------
+@router.post("/kixie/lists/push")
+async def push_list(body: PushListBody):
+    # TODO: implement real Kixie list API call
+    return {"pushed": True, "list_name": body.list_name, "count": len(body.contacts)}
