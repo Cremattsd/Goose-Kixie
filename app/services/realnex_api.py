@@ -1,15 +1,19 @@
+# app/services/realnex_api.py
 import os
 from typing import Any, Dict, Optional, AsyncIterator, List
 from urllib.parse import urlencode, urlparse, parse_qs
 
 import httpx
 
-# Base URLs
+# -------------------------------------------------------------------
+# Bases
+# -------------------------------------------------------------------
 BASE = os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm").rstrip("/")
 ODATA_BASE = BASE.replace("/Crm", "/CrmOData")
 
-# ---------- low-level HTTP helpers ----------
-
+# -------------------------------------------------------------------
+# Low-level HTTP helpers
+# -------------------------------------------------------------------
 def _headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -48,8 +52,9 @@ async def _post_json(url: str, token: str, payload: Dict[str, Any]) -> Dict[str,
             status = getattr(getattr(e, "response", None), "status_code", 599)
             return {"status": status, "error": str(e)}
 
-# ---------- REST: Contacts, Search, Create ----------
-
+# -------------------------------------------------------------------
+# REST: Contacts & Search
+# -------------------------------------------------------------------
 async def get_contacts(token: str, query_params: Dict[str, Any]) -> Dict[str, Any]:
     """
     GET /Crm/Contact?q=...
@@ -68,7 +73,8 @@ async def search_any(token: str, q: str) -> Dict[str, Any]:
 async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     POST /Crm/Contact
-    Payload example: { "firstName":"", "lastName":"", "mobile":"+1...", "source":"kixie" }
+    Payload example:
+      { "firstName":"", "lastName":"", "mobile":"+1...", "source":"kixie" }
     Returns created contact with Key.
     """
     url = f"{BASE}/Contact"
@@ -83,9 +89,6 @@ async def create_contact_by_number(
     company: Optional[str] = None,
     source: str = "kixie",
 ) -> Dict[str, Any]:
-    """
-    Convenience wrapper for minimal contact creation.
-    """
     payload: Dict[str, Any] = {
         "mobile": number_e164,
         "firstName": first_name or "",
@@ -98,18 +101,19 @@ async def create_contact_by_number(
         payload["company"] = company
     return await create_contact(token, payload)
 
-# ---------- REST: History (object-scoped) ----------
-
+# -------------------------------------------------------------------
+# REST: History (object-scoped)
+# -------------------------------------------------------------------
 async def create_history_record(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fallback: POST /Crm/history (unlinked); returns history row (Key)
+    POST /Crm/history (generic history row; returns Key)
     """
     url = f"{BASE}/history"
     return await _post_json(url, token, payload)
 
 async def add_object_to_history(token: str, history_key: str, object_key: str) -> Dict[str, Any]:
     """
-    POST /Crm/history/{historyKey}/object (try two casings)
+    POST /Crm/history/{historyKey}/object — try two casings
     """
     paths = [
         f"{BASE}/history/{history_key}/object",
@@ -175,7 +179,6 @@ async def create_history_for_object(
 
     return last
 
-# Back-compat name used by your kixie.py (now accepts optional object_key)
 async def create_history(token: str, payload: Dict[str, Any], object_key: Optional[str] = None) -> Dict[str, Any]:
     """
     Legacy entrypoint:
@@ -189,29 +192,29 @@ async def create_history(token: str, payload: Dict[str, Any], object_key: Option
             _ = await add_object_to_history(token, str(hk), object_key)
     return created
 
-# ---------- OData helpers ----------
-
+# -------------------------------------------------------------------
+# OData helpers
+# -------------------------------------------------------------------
 def _odata_url(path: str) -> str:
     return f"{ODATA_BASE}/{path.lstrip('/')}"
 
 async def list_odata_entitysets(token: str) -> Dict[str, Any]:
     """
-    OData service document:
-      GET /CrmOData/          -> usually returns {"value":[{"name":"Contacts","url":"Contacts"}, ...]}
+    OData service root (lists entity sets)
+      GET /CrmOData/
     """
-    url = ODATA_BASE  # service root
+    url = ODATA_BASE
     return await _get_json(url, token)
 
 def _escape_odata_str(val: str) -> str:
-    # escape single quotes for OData
     return val.replace("'", "''")
 
 async def search_contact_by_phone_odata(token: str, phone_e164: str) -> Dict[str, Any]:
     """
     GET /CrmOData/Contacts?$select=...&$filter=...
-    Try multiple fields (Mobile, Work, Home, Phone, BusinessPhone) and both exact + contains matches.
+    Tries multiple fields (Mobile, Work, Home, Phone, BusinessPhone)
+    with both exact and contains matches; also normalizes to last-10.
     """
-    # normalize and build variants
     digits = "".join(ch for ch in str(phone_e164) if ch.isdigit())
     last10 = digits[-10:] if len(digits) >= 10 else digits
     variants = [phone_e164, f"+1{last10}", last10]
@@ -232,7 +235,7 @@ async def search_contact_by_phone_odata(token: str, phone_e164: str) -> Dict[str
         "$filter": odata_filter,
         "$top": "200",
     }
-    # Keep parentheses/commas
+    # preserve parentheses/commas in filter
     url = _odata_url(f"Contacts?{urlencode(params, safe='(),= ')}")
     return await _get_json(url, token)
 
@@ -245,12 +248,9 @@ async def create_history_odata(
     event_type_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Try to create History via OData entity set(s).
-    Because RealNex tenants can differ, try a few combinations:
-      - POST /CrmOData/History
-      - POST /CrmOData/Histories
-    with varying date field names and payload shapes.
-    If all OData attempts fail, the caller should fall back to REST.
+    Attempt History creation via OData entity sets.
+    Tries /CrmOData/History and /CrmOData/Histories with a few date fields.
+    If it fails, caller should fall back to REST.
     """
     endpoints = [
         _odata_url("History"),
@@ -264,7 +264,6 @@ async def create_history_odata(
             "Title": subject,
             dfield: date_iso,
             "Note": note,
-            # try to bind directly to the contact by key
             "ObjectKey": contact_key,
             "EntityType": "Contact",
         }
@@ -272,7 +271,7 @@ async def create_history_odata(
             p["EventTypeKey"] = event_type_key
         return p
 
-    last = {}
+    last: Dict[str, Any] = {}
     for ep in endpoints:
         for df in date_fields:
             res = await _post_json(ep, token, _payload(df))
@@ -282,8 +281,9 @@ async def create_history_odata(
 
     return last
 
-# ---------- Extra OData: paging helpers (kept for dialer sync) ----------
-
+# -------------------------------------------------------------------
+# Extra OData: paging helpers (dialer sync)
+# -------------------------------------------------------------------
 async def odata_contacts_page(
     token: str,
     select: str,
