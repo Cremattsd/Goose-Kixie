@@ -1,26 +1,64 @@
-from dotenv import load_dotenv; load_dotenv()
+# app/services/realnex_api.py
+import os, httpx, re
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI
-from .routes.dialer import router as dialer_router
+BASE = os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm").rstrip("/")
+ODATA_BASE = BASE.replace("/Crm", "/CrmOData")
 
-app = FastAPI(title="Goose-Kixie (RealNex wired)")
+def _headers(token: str) -> Dict[str,str]:
+    return {"Authorization": f"Bearer {token}", "Accept":"application/json", "Content-Type":"application/json"}
 
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "routes": [
-            "/health",
-            "/webhooks/kixie",
-            "/activities/call",
-            "/contacts/search",
-            "/contacts",
-            "/kixie/lists/push",
-        ],
-    }
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=httpx.Timeout(25.0))
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception:
+        data = {"raw": await resp.aread()}
+    if isinstance(data, dict):
+        data.setdefault("status", resp.status_code)
+    return data
 
-app.include_router(dialer_router, tags=["dialer"])
+def normalize_phone_e164ish(raw: Optional[str], default_country="US") -> Optional[str]:
+    if not raw:
+        return None
+    digits = re.sub(r"\D+", "", raw)
+    if not digits:
+        return None
+    # naive US normalization
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if digits.startswith("1") and len(digits) == 11:
+        return f"+{digits}"
+    if raw.startswith("+"):
+        return f"+{digits}"
+    return f"+{digits}"
+
+async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
+    url = f"{BASE}/Contacts/search"
+    params = {"phone": phone_e164}
+    async with _client() as client:
+        try:
+            r = await client.get(url, params=params, headers=_headers(token))
+            return await _format_resp(r)
+        except httpx.HTTPError as e:
+            return {"status": getattr(getattr(e, "response", None), "status_code", 599), "error": str(e)}
+
+async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    url = f"{BASE}/Contacts"
+    async with _client() as client:
+        try:
+            r = await client.post(url, json=payload, headers=_headers(token))
+            return await _format_resp(r)
+        except httpx.HTTPError as e:
+            return {"status": getattr(getattr(e, "response", None), "status_code", 599), "error": str(e)}
+
+async def create_activity(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    url = f"{BASE}/Activities"
+    async with _client() as client:
+        try:
+            r = await client.post(url, json=payload, headers=_headers(token))
+            return await _format_resp(r)
+        except httpx.HTTPError as e:
+            return {"status": getattr(getattr(e, "response", None), "status_code", 599), "error": str(e)}
