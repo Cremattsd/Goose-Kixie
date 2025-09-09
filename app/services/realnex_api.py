@@ -1,8 +1,6 @@
 import os, httpx, re, functools, asyncio
 from typing import Any, Dict, Optional, List, Tuple
 
-# ------------------ env / base handling ------------------
-
 def get_rn_token() -> str:
     return os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN") or ""
 
@@ -12,7 +10,6 @@ def _bases_from_env() -> List[str]:
     if len(parts) == 1:
         b = parts[0]
         variants = [b]
-        # add siblings commonly seen
         if b.lower().endswith("/crm"):
             root = b[:-4]
             variants += [root + "/CrmOData", root + "/CRM", root + "/crmodata"]
@@ -39,8 +36,6 @@ async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
         data.setdefault("url", str(resp.request.url))
         data.setdefault("method", resp.request.method)
     return data
-
-# ------------------ helpers ------------------
 
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     if not raw: return None
@@ -70,10 +65,9 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
                     return {"status": 599, "error": str(e), "attempted": url}
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
-# ------------------ Contacts / Activities / History ------------------
+# ---------- Contacts & History (only) ----------
 
 async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
-    # keep search paths flexible
     return await _try_paths("GET",
         ["Contacts/search","Contact/search","contacts/search","contact/search"],
         token, params={"phone": phone_e164})
@@ -84,19 +78,13 @@ async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
         ["contact","Contact","contacts","Contacts"],
         token, json=payload)
 
-async def create_activity(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    # some tenants don’t expose Activities; we keep for optional use
-    return await _try_paths("POST",
-        ["Activities","Activity","activities","activity"],
-        token, json=payload)
-
 async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    # your tenant: POST /api/v1/Crm/history (lowercase)
+    # your tenant: POST /api/v1/Crm/history
     return await _try_paths("POST",
         ["history","History","histories","Histories"],
         token, json=payload)
 
-# ------------------ Resolve user/team by email (primary: /Crm, fallback: OData) ------------------
+# ---------- Resolve user/team by email ----------
 
 _USER_LIST_PATHS = ["users","Users","CRM/users","CRM/Users"]
 _TEAM_LIST_PATHS = ["teams","Teams","CRM/teams","CRM/Teams"]
@@ -142,7 +130,7 @@ async def _first_ok(method: str, rel_paths: List[str], token: str):
                     continue
     return (None, None)
 
-async def _crm_find_user_team(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
+async def _crm_find_user_team(token: str, email: str):
     ctx: Dict[str,Any] = {"mode":"crm_lists"}
     users_url, users_payload = await _first_ok("GET", _USER_LIST_PATHS, token)
     teams_url, teams_payload = await _first_ok("GET", _TEAM_LIST_PATHS, token)
@@ -150,18 +138,15 @@ async def _crm_find_user_team(token: str, email: str) -> Tuple[Optional[str], Op
 
     user_key = team_key = None
 
-    # search user by email locally
     if isinstance(users_payload, list):
         for u in users_payload:
             e = _pluck_any(u, _EMAIL_FIELDS)
             if e and e.lower() == email.lower():
                 user_key = _pluck_any(u, _USER_KEY_FIELDS)
-                # sometimes team comes on the user object
                 team_key = _pluck_any(u, ["TeamKey","teamKey","DefaultTeamKey","defaultTeamKey"]) or team_key
                 ctx["user_match"] = u
                 break
 
-    # if no team yet, try to pick one that references the user email
     if not team_key and isinstance(teams_payload, list):
         for t in teams_payload:
             owner = _pluck_any(t, ["OwnerEmail","ownerEmail","Email","email"])
@@ -172,7 +157,7 @@ async def _crm_find_user_team(token: str, email: str) -> Tuple[Optional[str], Op
 
     return user_key, team_key, ctx
 
-async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]) -> Optional[Dict[str,Any]]:
+async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]):
     url = f"{base}/{path}"
     try:
         r = await _send(client, "GET", url, token, params=params)
@@ -190,17 +175,16 @@ def _odata_filter(email: str) -> Dict[str,str]:
     conds = [f"{f} eq '{email}'" for f in _EMAIL_FIELDS]
     return {"$filter": " or ".join(conds), "$top": "1"}
 
-async def _odata_find_user_team(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
+async def _odata_find_user_team(token: str, email: str):
     ctx: Dict[str,Any] = {"mode":"odata"}
     params = _odata_filter(email)
     async with _client() as client:
         user_obj = None
-        hit_user_url = None
         for base in BASES:
             for coll in _ODATA_USER_COLLECTIONS:
                 u = await _odata_first(client, base, coll, token, params)
                 if u:
-                    user_obj = u; hit_user_url = f"{base}/{coll}"; break
+                    user_obj = u; break
             if user_obj: break
 
         user_key = team_key = None
@@ -222,11 +206,10 @@ async def _odata_find_user_team(token: str, email: str) -> Tuple[Optional[str], 
             if team_obj:
                 team_key = _pluck_any(team_obj, _TEAM_KEY_FIELDS)
 
-    ctx.update({"userHit": hit_user_url, "userKey": user_key, "teamKey": team_key})
+    ctx.update({"userKey": user_key, "teamKey": team_key})
     return user_key, team_key, ctx
 
-async def resolve_user_team_by_email(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
-    """Primary via /Crm/users & /Crm/teams; fallback via OData. Cached per email."""
+async def resolve_user_team_by_email(token: str, email: str):
     k = _cache_key(email)
     async with _user_lock:
         if k in _user_cache:
@@ -245,17 +228,10 @@ async def resolve_user_team_by_email(token: str, email: str) -> Tuple[Optional[s
         _user_cache[k] = (uk, tk)
     return uk, tk, ctx
 
-# ------------------ debug probe ------------------
-
 async def probe_endpoints(token: str) -> Dict[str, Any]:
     shapes = [
-        # primary endpoints seen in your Swagger
         "contact","history","users","teams",
-        # case/alt variants
         "Contact","History","Users","Teams",
-        # legacy/fallbacks
-        "Contacts","Contact","Activities","Activity","history","History",
-        # odata collections (existence)
         "CrmOData/Users","CrmOData/Teams","crmodata/Users","crmodata/Teams",
         "OData/Users","OData/Teams","CRM/Users","CRM/Teams"
     ]
