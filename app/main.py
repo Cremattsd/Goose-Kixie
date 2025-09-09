@@ -1,9 +1,6 @@
-mkdir -p app/routes app/services app/schemas
-cat > app/main.py <<'PY'
 from dotenv import load_dotenv; load_dotenv()
 
 from fastapi import FastAPI
-
 from .routes.dialer import router as dialer_router
 from .routes.debug_realnex import router as debug_router
 
@@ -30,4 +27,3 @@ def health():
 
 app.include_router(dialer_router, tags=["dialer"])
 app.include_router(debug_router, tags=["debug"])
-PY
