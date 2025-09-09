@@ -1,4 +1,5 @@
-import os, httpx, re, functools, asyncio
+cat > app/services/realnex_api.py <<'PY'
+import os, httpx, re, asyncio
 from typing import Any, Dict, Optional, List, Tuple
 
 def get_rn_token() -> str:
@@ -73,13 +74,11 @@ async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
         token, params={"phone": phone_e164})
 
 async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    # your tenant: POST /api/v1/Crm/contact
     return await _try_paths("POST",
         ["contact","Contact","contacts","Contacts"],
         token, json=payload)
 
 async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    # your tenant: POST /api/v1/Crm/history
     return await _try_paths("POST",
         ["history","History","histories","Histories"],
         token, json=payload)
@@ -246,3 +245,4 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
                 except Exception as e:
                     out["checks"].append({"url": url, "error": str(e)})
     return out
+PY
