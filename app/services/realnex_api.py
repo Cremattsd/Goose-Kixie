@@ -12,7 +12,7 @@ def _bases_from_env() -> List[str]:
     if len(parts) == 1:
         b = parts[0]
         variants = [b]
-        # add common siblings
+        # add siblings commonly seen
         if b.lower().endswith("/crm"):
             root = b[:-4]
             variants += [root + "/CrmOData", root + "/CRM", root + "/crmodata"]
@@ -22,11 +22,9 @@ def _bases_from_env() -> List[str]:
 BASES = _bases_from_env()
 
 def _headers(token: str) -> Dict[str,str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"}
 
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
@@ -75,61 +73,104 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
 # ------------------ Contacts / Activities / History ------------------
 
 async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
+    # keep search paths flexible
     return await _try_paths("GET",
         ["Contacts/search","Contact/search","contacts/search","contact/search"],
         token, params={"phone": phone_e164})
 
 async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    # your tenant: POST /api/v1/Crm/contact
     return await _try_paths("POST",
-        ["Contacts","Contact","contacts","contact"],
+        ["contact","Contact","contacts","Contacts"],
         token, json=payload)
 
 async def create_activity(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    # some tenants don’t expose Activities; we keep for optional use
     return await _try_paths("POST",
         ["Activities","Activity","activities","activity"],
         token, json=payload)
 
 async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    # your tenant: POST /api/v1/Crm/history (lowercase)
     return await _try_paths("POST",
         ["history","History","histories","Histories"],
         token, json=payload)
 
-# ------------------ OData: resolve user/team by email ------------------
+# ------------------ Resolve user/team by email (primary: /Crm, fallback: OData) ------------------
 
-# Collections to probe (order matters)
+_USER_LIST_PATHS = ["users","Users","CRM/users","CRM/Users"]
+_TEAM_LIST_PATHS = ["teams","Teams","CRM/teams","CRM/Teams"]
+
 _ODATA_USER_COLLECTIONS = [
     "CrmOData/Users", "CrmOData/users", "crmodata/Users", "crmodata/users",
-    "OData/Users", "odata/Users", "CRM/Users", "CRM/users",
+    "OData/Users", "odata/Users",
 ]
 _ODATA_TEAM_COLLECTIONS = [
     "CrmOData/Teams", "CrmOData/teams", "crmodata/Teams", "crmodata/teams",
-    "OData/Teams", "odata/Teams", "CRM/Teams", "CRM/teams",
+    "OData/Teams", "odata/Teams",
 ]
 
-# possible field names for filtering/keys
-_EMAIL_FIELDS = ["Email","email","UserEmail","Username","username","login","Login"]
 _USER_KEY_FIELDS = ["Key","Id","id","UserKey","userKey","UserId","userId"]
 _TEAM_KEY_FIELDS = ["TeamKey","teamKey","Key","Id","id"]
+_EMAIL_FIELDS = ["Email","email","UserEmail","Username","username","Login","login"]
 
-def _build_odata_filter(email: str) -> Dict[str, str]:
-    # Try several filter syntaxes
-    conds = [
-        f"Email eq '{email}'",
-        f"email eq '{email}'",
-        f"UserEmail eq '{email}'",
-        f"Username eq '{email}'",
-        f"username eq '{email}'",
-        f"Login eq '{email}'",
-        f"login eq '{email}'",
-    ]
-    return {"$filter": " or ".join(conds), "$top": "1"}
+_user_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+_user_lock = asyncio.Lock()
 
-@functools.lru_cache(maxsize=512)
 def _cache_key(email: str) -> str:
     return email.lower().strip()
 
-_user_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}  # email -> (userKey, teamKey)
-_user_lock = asyncio.Lock()
+def _pluck_any(d: Dict[str,Any], names: List[str]) -> Optional[str]:
+    for n in names:
+        if n in d and d[n]:
+            return str(d[n])
+    return None
+
+async def _first_ok(method: str, rel_paths: List[str], token: str):
+    async with _client() as client:
+        for base in BASES:
+            for p in rel_paths:
+                url = f"{base}/{p}"
+                try:
+                    r = await _send(client, method, url, token)
+                    if r.status_code < 400:
+                        try:
+                            return (url, r.json())
+                        except Exception:
+                            return (url, None)
+                except httpx.HTTPError:
+                    continue
+    return (None, None)
+
+async def _crm_find_user_team(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
+    ctx: Dict[str,Any] = {"mode":"crm_lists"}
+    users_url, users_payload = await _first_ok("GET", _USER_LIST_PATHS, token)
+    teams_url, teams_payload = await _first_ok("GET", _TEAM_LIST_PATHS, token)
+    ctx.update({"users_url": users_url, "teams_url": teams_url})
+
+    user_key = team_key = None
+
+    # search user by email locally
+    if isinstance(users_payload, list):
+        for u in users_payload:
+            e = _pluck_any(u, _EMAIL_FIELDS)
+            if e and e.lower() == email.lower():
+                user_key = _pluck_any(u, _USER_KEY_FIELDS)
+                # sometimes team comes on the user object
+                team_key = _pluck_any(u, ["TeamKey","teamKey","DefaultTeamKey","defaultTeamKey"]) or team_key
+                ctx["user_match"] = u
+                break
+
+    # if no team yet, try to pick one that references the user email
+    if not team_key and isinstance(teams_payload, list):
+        for t in teams_payload:
+            owner = _pluck_any(t, ["OwnerEmail","ownerEmail","Email","email"])
+            if owner and owner.lower() == email.lower():
+                team_key = _pluck_any(t, _TEAM_KEY_FIELDS)
+                ctx["team_match"] = t
+                break
+
+    return user_key, team_key, ctx
 
 async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]) -> Optional[Dict[str,Any]]:
     url = f"{base}/{path}"
@@ -138,102 +179,86 @@ async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: s
         if r.status_code == 404:
             return None
         data = await _format_resp(r)
-        # OData may wrap in 'value' list; otherwise return dict
-        if isinstance(data, dict):
-            # prefer a list in 'value'
-            if isinstance(data.get("value"), list) and data["value"]:
-                return data["value"][0]
-            # or maybe it's a single entity
-            # strip helper fields we added
-            d = {k:v for k,v in data.items() if k not in ("status","url","method")}
-            if d:
-                return d
-        return None
+        if isinstance(data.get("value"), list) and data["value"]:
+            return data["value"][0]
+        d = {k:v for k,v in data.items() if k not in ("status","url","method")}
+        return d or None
     except httpx.HTTPError:
         return None
 
-async def resolve_user_team_by_email(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
-    """
-    Returns (userKey, teamKey, context) for debugging.
-    Caches results per email.
-    """
-    key = _cache_key(email)
-    async with _user_lock:
-        if key in _user_cache:
-            uk, tk = _user_cache[key]
-            return uk, tk, {"cached": True}
+def _odata_filter(email: str) -> Dict[str,str]:
+    conds = [f"{f} eq '{email}'" for f in _EMAIL_FIELDS]
+    return {"$filter": " or ".join(conds), "$top": "1"}
 
-    params = _build_odata_filter(email)
-    ctx: Dict[str, Any] = {"tried": []}
+async def _odata_find_user_team(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
+    ctx: Dict[str,Any] = {"mode":"odata"}
+    params = _odata_filter(email)
     async with _client() as client:
-        # Find USER
-        user_obj: Optional[Dict[str,Any]] = None
-        hit_user_url: Optional[str] = None
+        user_obj = None
+        hit_user_url = None
         for base in BASES:
             for coll in _ODATA_USER_COLLECTIONS:
                 u = await _odata_first(client, base, coll, token, params)
-                ctx["tried"].append(f"{base}/{coll}")
                 if u:
-                    user_obj = u
-                    hit_user_url = f"{base}/{coll}"
-                    break
-            if user_obj:
-                break
+                    user_obj = u; hit_user_url = f"{base}/{coll}"; break
+            if user_obj: break
 
-        user_key: Optional[str] = None
-        team_key: Optional[str] = None
-
+        user_key = team_key = None
         if user_obj:
-            # pull userKey
-            for f in _USER_KEY_FIELDS:
-                if f in user_obj and user_obj[f]:
-                    user_key = str(user_obj[f]); break
-            # find team directly on user if present
-            for f in ["TeamKey","teamKey","DefaultTeamKey","defaultTeamKey"]:
-                if f in user_obj and user_obj[f]:
-                    team_key = str(user_obj[f]); break
+            user_key = _pluck_any(user_obj, _USER_KEY_FIELDS)
+            team_key = _pluck_any(user_obj, ["TeamKey","teamKey","DefaultTeamKey","defaultTeamKey"]) or None
 
-        # If still no team, query TEAMS with any relationship hints
         if not team_key:
-            team_obj: Optional[Dict[str,Any]] = None
-            # try by "OwnerEmail == email" style filters too
-            team_params = {
-                "$top": "1",
-                "$filter": " or ".join([
-                    f"OwnerEmail eq '{email}'",
-                    f"ownerEmail eq '{email}'",
-                    f"Email eq '{email}'",
-                    f"email eq '{email}'",
-                ])
-            }
+            team_obj = None
             for base in BASES:
                 for coll in _ODATA_TEAM_COLLECTIONS:
-                    t = await _odata_first(client, base, coll, token, team_params)
-                    ctx["tried"].append(f"{base}/{coll}")
+                    t = await _odata_first(client, base, coll, token, {
+                        "$top":"1",
+                        "$filter": " or ".join([f"OwnerEmail eq '{email}'", f"Email eq '{email}'", f"email eq '{email}'"])
+                    })
                     if t:
-                        team_obj = t
-                        break
-                if team_obj:
-                    break
+                        team_obj = t; break
+                if team_obj: break
             if team_obj:
-                for f in _TEAM_KEY_FIELDS:
-                    if f in team_obj and team_obj[f]:
-                        team_key = str(team_obj[f]); break
+                team_key = _pluck_any(team_obj, _TEAM_KEY_FIELDS)
+
+    ctx.update({"userHit": hit_user_url, "userKey": user_key, "teamKey": team_key})
+    return user_key, team_key, ctx
+
+async def resolve_user_team_by_email(token: str, email: str) -> Tuple[Optional[str], Optional[str], Dict[str,Any]]:
+    """Primary via /Crm/users & /Crm/teams; fallback via OData. Cached per email."""
+    k = _cache_key(email)
+    async with _user_lock:
+        if k in _user_cache:
+            uk, tk = _user_cache[k]
+            return uk, tk, {"cached": True}
+
+    uk, tk, ctx1 = await _crm_find_user_team(token, email)
+    if not uk or not tk:
+        uk2, tk2, ctx2 = await _odata_find_user_team(token, email)
+        uk = uk or uk2; tk = tk or tk2
+        ctx = {"crm": ctx1, "odata": ctx2}
+    else:
+        ctx = {"crm": ctx1}
 
     async with _user_lock:
-        _user_cache[key] = (user_key, team_key)
-    ctx.update({"userKey": user_key, "teamKey": team_key, "userHit": hit_user_url})
-    return user_key, team_key, ctx
+        _user_cache[k] = (uk, tk)
+    return uk, tk, ctx
 
 # ------------------ debug probe ------------------
 
 async def probe_endpoints(token: str) -> Dict[str, Any]:
-    shapes = ["Contacts","Contact","contacts","contact",
-              "Activities","Activity","activities","activity",
-              "history","History","histories","Histories",
-              # odata collections (HEAD/GET for existence)
-              "CrmOData/Users","CrmOData/Teams","crmodata/Users","crmodata/Teams",
-              "OData/Users","OData/Teams","CRM/Users","CRM/Teams"]
+    shapes = [
+        # primary endpoints seen in your Swagger
+        "contact","history","users","teams",
+        # case/alt variants
+        "Contact","History","Users","Teams",
+        # legacy/fallbacks
+        "Contacts","Contact","Activities","Activity","history","History",
+        # odata collections (existence)
+        "CrmOData/Users","CrmOData/Teams","crmodata/Users","crmodata/Teams",
+        "OData/Users","OData/Teams","CRM/Users","CRM/Teams"
+    ]
     out = {"bases": BASES, "checks": []}
     async with _client() as client:
         for base in BASES:
