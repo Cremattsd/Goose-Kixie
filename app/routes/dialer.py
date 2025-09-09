@@ -1,14 +1,41 @@
-cat > app/routes/dialer.py <<'PY'
-from fastapi import APIRouter, Request, HTTPException, Header, Query
-from typing import Optional, Any, Dict
-import os, hmac, hashlib
+from fastapi import APIRouter, Request, HTTPException, Query
+from pydantic import BaseModel
+import os, hmac, hashlib, json
+from typing import Optional
 
 from ..services.realnex_api import (
-    normalize_phone_e164ish, search_by_phone, create_contact, create_history, get_rn_token
+    normalize_phone_e164ish,
+    search_by_phone,
+    create_contact,
+    create_history,
+    get_rn_token,
 )
-from ..schemas.kixie import KixieWebhook, CallActivity, SimpleContact
 
 router = APIRouter()
+
+class CallActivity(BaseModel):
+    contact_id: Optional[str] = None
+    company_id: Optional[str] = None
+    agent_email: str
+    direction: str
+    disposition: str
+    duration_sec: int
+    started_at: str
+    ended_at: str
+    notes: Optional[str] = None
+    recording_url: Optional[str] = None
+    from_number: Optional[str] = None
+    to_number: Optional[str] = None
+    call_id: Optional[str] = None
+    is_completed: bool = True
+    due_date: Optional[str] = None
+
+class SimpleContact(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
 
 @router.get("/health/realnex")
 def health_realnex():
@@ -17,7 +44,7 @@ def health_realnex():
 def _verify_kixie_signature(raw: bytes, header_sig: Optional[str]) -> None:
     secret = os.getenv("KIXIE_WEBHOOK_SECRET")
     if not secret:
-        return  # signature optional in dev / swagger
+        return
     if not header_sig:
         raise HTTPException(status_code=401, detail="Missing signature")
     calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -29,85 +56,62 @@ async def _ensure_contact_id(rn_token: str, phone_raw: Optional[str]) -> Optiona
     if not phone:
         return None
     found = await search_by_phone(rn_token, phone)
-    candidates = found.get("data") or found.get("value") or found.get("items") or []
-    if isinstance(candidates, list) and candidates:
-        first = candidates[0]
+    if (found.get("status") == 200) and (found.get("data") or found.get("value") or found.get("items")):
+        candidates = found.get("data") or found.get("value") or found.get("items") or []
+        first = candidates[0] if isinstance(candidates, list) and candidates else None
         if isinstance(first, dict):
-            for k in ("Id","id","ContactId","contactId","Key","key"):
-                if k in first and first[k]:
-                    return str(first[k])
+            for key in ("Id","id","ContactId","contactId","Key","key"):
+                if key in first:
+                    return str(first[key])
     created = await create_contact(rn_token, {
-        "FirstName": "",
-        "LastName": "",
-        "PrimaryPhone": phone,
-        "Source": "Kixie Auto-Create",
+        "FirstName": "", "LastName": "", "PrimaryPhone": phone, "Source": "Kixie Auto-Create",
     })
-    data = created.get("data") or created
-    if isinstance(data, dict):
-        for k in ("Id","id","ContactId","contactId","Key","key"):
-            if k in data and data[k]:
-                return str(data[k])
+    if created.get("status") in (200,201):
+        data = created.get("data") or created
+        for key in ("Id","id","ContactId","contactId","Key","key"):
+            if key in data:
+                return str(data[key])
     return None
 
-def _event_type_key(direction: str, kind: str = "CALL") -> int:
-    if kind.upper() == "SMS":
-        return int(os.getenv("RN_EVENTTYPEKEY_SMS", "2"))
-    return int(os.getenv("RN_EVENTTYPEKEY_CALL", os.getenv("RN_EVENTTYPEKEY_DEFAULT","1")))
-
-def _history_payload(a: CallActivity) -> Dict[str, Any]:
-    payload = {
-        "Subject": f"Call {a.direction} - {a.disposition}",
-        "Notes": a.notes,
-        "DurationSeconds": a.duration_sec,
-        "StartedAt": a.started_at,
-        "EndedAt": a.ended_at,
-        "ContactId": a.contact_id,
-        "CompanyId": a.company_id,
-        "OwnerEmail": a.agent_email,
-        "ExternalId": a.call_id,
-        "Source": "Kixie",
-        "IsCompleted": a.is_completed,
-        "ActivityType": "Phone Call",
-        "Result": a.disposition,
-        "EventTypeKey": _event_type_key(a.direction, "CALL"),
+def _history_payload(a: CallActivity, user_key: Optional[str], team_key: Optional[str]) -> dict:
+    return {
+        "userKey": user_key,
+        "teamKey": team_key,
+        "published": True,
+        "startDate": a.started_at,
+        "endDate": a.ended_at,
+        "timeless": False,
+        "eventTypeKey": 1,
+        "statusKey": 1,
+        "subject": f"Kixie Call {a.direction} - {a.disposition}",
+        "notes": a.notes or f"Call duration {a.duration_sec} sec",
     }
-    date_field = os.getenv("RN_ODATA_HISTORY_DATE_FIELD", "Date")
-    if a.ended_at:
-        payload.setdefault(date_field, a.ended_at)
-    elif a.started_at:
-        payload.setdefault(date_field, a.started_at)
-    if not a.is_completed and a.due_date:
-        payload["DueDate"] = a.due_date
-    return {k: v for k, v in payload.items() if v is not None}
 
 @router.post("/webhooks/kixie")
-async def kixie_webhook(
-    payload: KixieWebhook,
-    request: Request,
-    x_kixie_signature: Optional[str] = Header(default=None, alias="X-Kixie-Signature")
-):
-    raw = await request.body()
-    _verify_kixie_signature(raw, x_kixie_signature)
-
+async def kixie_webhook(request: Request):
     rn_token = get_rn_token()
     dry_run = not bool(rn_token)
 
-    direction = payload.direction or "outbound"
-    customer_num = payload.to_number if direction == "outbound" else payload.from_number
+    raw = await request.body()
+    _verify_kixie_signature(raw, request.headers.get("X-Kixie-Signature"))
+    p = json.loads(raw.decode("utf-8"))
+
+    direction = p.get("direction","outbound")
+    from_number = p.get("from_number") or p.get("caller_number")
+    to_number   = p.get("to_number")   or p.get("callee_number")
+    customer_num = to_number if direction == "outbound" else from_number
 
     a = CallActivity(
-        agent_email=payload.agent_email or "unknown@realnex.com",
+        agent_email=p.get("agent_email","unknown@realnex.com"),
         direction=direction,
-        disposition=payload.disposition or "Unknown",
-        duration_sec=payload.duration_sec or 0,
-        started_at=payload.started_at or "",
-        ended_at=payload.ended_at,
-        notes=f"Kixie event {payload.event or 'call.completed'} (auto-logged)",
-        recording_url=payload.recording_url,
-        from_number=payload.from_number,
-        to_number=payload.to_number,
-        call_id=payload.call_id,
-        is_completed=True,
+        disposition=p.get("disposition") or p.get("call_result","unknown"),
+        duration_sec=int(p.get("duration_sec") or p.get("call_duration") or 0),
+        started_at=p.get("started_at") or p.get("start_time") or "",
+        ended_at=p.get("ended_at") or p.get("end_time") or "",
+        notes=f"Kixie event {p.get('event','call.completed')} (auto-logged)",
+        recording_url=p.get("recording_url"),
+        from_number=from_number, to_number=to_number, call_id=p.get("call_id"),
+        is_completed=True
     )
 
     if not dry_run:
@@ -116,19 +120,12 @@ async def kixie_webhook(
     if dry_run:
         return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set","activity":a.model_dump()}
 
-    resp = await create_history(rn_token, _history_payload(a))
+    # Create history log
+    resp = await create_history(rn_token, _history_payload(a, None, None))
     return {"status": resp.get("status"), "realnex": resp, "activity": a.model_dump()}
 
-@router.post("/activities/call")
-async def log_call(activity: CallActivity):
-    rn_token = get_rn_token()
-    if not rn_token:
-        return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set","activity":activity.model_dump()}
-    resp = await create_history(rn_token, _history_payload(activity))
-    return {"status": resp.get("status"), "realnex": resp}
-
 @router.get("/contacts/search")
-async def contacts_search(phone: str = Query(..., description="Phone number to search (any format)")):
+async def contacts_search(phone: str = Query(...)):
     rn_token = get_rn_token()
     if not rn_token:
         return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set"}
@@ -150,4 +147,3 @@ async def contacts_create(body: SimpleContact):
     }
     payload = {k:v for k,v in payload.items() if v is not None}
     return await create_contact(rn_token, payload)
-PY
