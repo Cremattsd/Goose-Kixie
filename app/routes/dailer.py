@@ -1,193 +1,182 @@
 # app/routes/dialer.py
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from fastapi import APIRouter, Request, HTTPException, Query
+from pydantic import BaseModel
+import os, hmac, hashlib, json
+from typing import Optional, Dict, Any
 
 from ..services.realnex_api import (
-    # EXPECTED EXPORTS in app/services/realnex_api.py:
-    # - resolve_user_and_team(agent_email: str) -> dict
-    # - create_contact(first_name: str, last_name: str, email: Optional[str], phone: Optional[str], company: Optional[str]) -> dict
-    # - find_contact_by_phone(phone_e164: str) -> Optional[dict]
-    # - create_history_record(payload: dict) -> dict
-    resolve_user_and_team,
+    normalize_phone_e164ish,
+    search_by_phone,
     create_contact,
-    find_contact_by_phone,
-    create_history_record,
+    create_history,
+    get_rn_token,
 )
+from ..schemas.kixie import KixieWebhook
 
 router = APIRouter()
 
+# ------- Models -------
 
-@router.get("/health")
-def health():
-    return {"ok": True, "routes": ["/health", "/contacts", "/history/call", "/debug/realnex/resolve_user"]}
+class CallActivity(BaseModel):
+    contact_id: Optional[str] = None
+    company_id: Optional[str] = None
+    agent_email: str
+    direction: str
+    disposition: str
+    duration_sec: int
+    started_at: str
+    ended_at: str
+    notes: Optional[str] = None
+    recording_url: Optional[str] = None
+    from_number: Optional[str] = None
+    to_number: Optional[str] = None
+    call_id: Optional[str] = None
+    is_completed: bool = True
+    due_date: Optional[str] = None
 
-
-@router.get("/health/realnex")
-def health_realnex():
-    # simple check that JWT is loaded by the service module
-    has = True
-    try:
-        # will raise if not configured
-        _ = resolve_user_and_team  # noqa: F401
-    except Exception:
-        has = False
-    return {"has_jwt": has}
-
-
-class ContactIn(BaseModel):
-    first_name: str
-    last_name: str
-    email: Optional[EmailStr] = None
+class SimpleContact(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
     phone: Optional[str] = None
     company: Optional[str] = None
 
+# ------- Helpers -------
 
-@router.post("/contacts")
-def create_contact_endpoint(body: ContactIn):
-    try:
-        resp = create_contact(
-            first_name=body.first_name,
-            last_name=body.last_name,
-            email=body.email,
-            phone=body.phone,
-            company=body.company,
-        )
-        return resp
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def _verify_kixie_signature(raw: bytes, header_sig: Optional[str]) -> None:
+    secret = os.getenv("KIXIE_WEBHOOK_SECRET")
+    if not secret:
+        return
+    if not header_sig:
+        raise HTTPException(status_code=401, detail="Missing signature")
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, header_sig):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
+def _event_type_key(disposition: str) -> int:
+    """Choose an EventTypeKey via env (defaults: call=1, sms=2)."""
+    disp = (disposition or "").lower()
+    if "sms" in disp or "text" in disp:
+        return int(os.getenv("RN_EVENTTYPEKEY_SMS", "2"))
+    if "dispo" in disp:
+        return int(os.getenv("RN_EVENTTYPEKEY_DISPOSITION", "1"))
+    if "call" in disp or True:
+        return int(os.getenv("RN_EVENTTYPEKEY_CALL", "1"))
 
-class HistoryCallIn(BaseModel):
-    # who made the call (we resolve user/team from this)
-    agent_email: EmailStr
+async def _ensure_contact_id(rn_token: str, phone_raw: Optional[str]) -> Optional[str]:
+    phone = normalize_phone_e164ish(phone_raw) if phone_raw else None
+    if not phone:
+        return None
+    found = await search_by_phone(rn_token, phone)
+    if (found.get("status") == 200) and (found.get("data") or found.get("value") or found.get("items")):
+        candidates = found.get("data") or found.get("value") or found.get("items") or []
+        first = candidates[0] if isinstance(candidates, list) and candidates else None
+        if isinstance(first, dict):
+            for key in ("Id","id","ContactId","contactId","Key","key"):
+                if key in first:
+                    return str(first[key])
+    created = await create_contact(rn_token, {
+        "FirstName": "", "LastName": "", "PrimaryPhone": phone, "Source": "Kixie Auto-Create",
+    })
+    if created.get("status") in (200, 201):
+        data = created.get("data") or created
+        for key in ("Id","id","ContactId","contactId","Key","key"):
+            if key in data:
+                return str(data[key])
+    return None
 
-    # basic call facts
-    direction: str  # "outbound" | "inbound"
-    disposition: Optional[str] = None
-    duration_sec: Optional[int] = None
-    started_at: Optional[str] = None   # ISO8601
-    ended_at: Optional[str] = None     # ISO8601
-    notes: Optional[str] = None
-    is_completed: Optional[bool] = True
+def _history_payload(a: CallActivity) -> Dict[str, Any]:
+    payload = {
+        "Subject": f"Call {a.direction} - {a.disposition}",
+        "Notes": a.notes,
+        "DurationSeconds": a.duration_sec,
+        "StartDate": a.started_at,
+        "EndDate": a.ended_at,
+        "ContactKey": a.contact_id,
+        "CompanyKey": a.company_id,
+        "OwnerEmail": a.agent_email,
+        "ExternalId": a.call_id,
+        "Source": "Kixie",
+        "IsCompleted": a.is_completed,
+        "EventTypeKey": _event_type_key(a.disposition),
+        "Direction": a.direction,
+        "Result": a.disposition,
+        "FromNumber": a.from_number,
+        "ToNumber": a.to_number,
+        "RecordingUrl": a.recording_url,
+    }
+    # strip None
+    return {k: v for k, v in payload.items() if v is not None}
 
-    # linking to a person
-    to_number: Optional[str] = None
-    from_number: Optional[str] = None
+# ------- Routes -------
 
-    # optional external references
-    call_id: Optional[str] = None
-    recording_url: Optional[str] = None
+@router.get("/health/realnex")
+def health_realnex():
+    return {"has_jwt": bool(get_rn_token())}
 
+@router.post("/webhooks/kixie", summary="Kixie Webhook")
+async def kixie_webhook(payload: KixieWebhook, request: Request):
+    rn_token = get_rn_token()
+    dry_run = not bool(rn_token)
 
-@router.post("/history/call")
-def create_history_for_call(body: HistoryCallIn):
-    """
-    Creates a RealNex History record for a phone call.
-    Flow:
-      1) resolve userKey/teamKey by agent_email
-      2) find or create a contact by phone (prefer 'to_number' for outbound, 'from_number' for inbound)
-      3) POST /api/v1/Crm/history with required fields + associations
-    """
-    try:
-        # 1) resolve user/team
-        resolved = resolve_user_and_team(body.agent_email)
-        user_key = resolved.get("userKey")
-        team_key = resolved.get("teamKey")
-        if not user_key or not team_key:
-            raise HTTPException(status_code=404, detail="Unable to resolve RealNex user/team from agent_email")
+    raw = await request.body()
+    _verify_kixie_signature(raw, request.headers.get("X-Kixie-Signature"))
 
-        # 2) pick the “other party” phone
-        target_phone = None
-        if body.direction and body.direction.lower().startswith("out"):
-            target_phone = body.to_number or body.from_number
-        else:
-            target_phone = body.from_number or body.to_number
+    a = CallActivity(
+        agent_email=payload.agent_email,
+        direction=payload.direction,
+        disposition=payload.disposition,
+        duration_sec=payload.duration_sec,
+        started_at=payload.started_at,
+        ended_at=payload.ended_at or payload.started_at,
+        notes=f"Kixie event {payload.event} (auto-logged)",
+        recording_url=str(payload.recording_url) if payload.recording_url else None,
+        from_number=payload.from_number,
+        to_number=payload.to_number,
+        call_id=payload.call_id,
+        is_completed=True,
+    )
 
-        contact_key = None
-        if target_phone:
-            existing = find_contact_by_phone(target_phone)
-            if existing and existing.get("objectKey"):
-                contact_key = existing["objectKey"]
-            else:
-                # create a bare contact if none found
-                created = create_contact(
-                    first_name="",
-                    last_name="",
-                    email=None,
-                    phone=target_phone,
-                    company=None,
-                )
-                contact_key = created.get("objectKey")
+    if not dry_run:
+        customer_num = payload.to_number if payload.direction == "outbound" else payload.from_number
+        a.contact_id = await _ensure_contact_id(rn_token, customer_num)
 
-        # 3) build history payload
-        subject = f"Call ({body.direction})"
-        if body.disposition:
-            subject += f" - {body.disposition}"
+    hist_payload = _history_payload(a)
+    if dry_run:
+        return {"status": "dry-run", "reason": "REALNEX_JWT/REALNEX_TOKEN not set", "history": hist_payload, "activity": a.model_dump()}
 
-        payload = {
-            # required ownership
-            "userKey": user_key,
-            "teamKey": team_key,
+    resp = await create_history(rn_token, hist_payload)
+    return {"status": resp.get("status"), "realnex": resp, "history": hist_payload}
 
-            # status / type
-            # These keys are enums in RealNex; if your tenant needs specific numbers, map them in realnex_api.py
-            "eventTypeKey": 0,    # e.g., 0 = Call (adjust if your tenant differs)
-            "statusKey": 0,       # e.g., 0 = Completed/Open (adjust as needed)
+@router.post("/activities/call", summary="Create RealNex Call History")
+async def log_call(activity: CallActivity):
+    rn_token = get_rn_token()
+    hist_payload = _history_payload(activity)
+    if not rn_token:
+        return {"status": "dry-run", "reason": "REALNEX_JWT/REALNEX_TOKEN not set", "history": hist_payload}
+    resp = await create_history(rn_token, hist_payload)
+    return {"status": resp.get("status"), "realnex": resp}
 
-            # timing
-            "published": True,
-            "timeless": False,
-            "startDate": body.started_at,
-            "endDate": body.ended_at,
+@router.get("/contacts/search", summary="Search contact by phone")
+async def contacts_search(phone: str = Query(...)):
+    rn_token = get_rn_token()
+    if not rn_token:
+        return {"status": "dry-run", "reason": "REALNEX_JWT/REALNEX_TOKEN not set"}
+    norm = normalize_phone_e164ish(phone)
+    return await search_by_phone(rn_token, norm or phone)
 
-            # presentation
-            "subject": subject,
-            "notes": body.notes or "",
-            "logical1": bool(body.is_completed),
-        }
-
-        # attach phone meta in free-form notes
-        extra = []
-        if body.duration_sec is not None:
-            extra.append(f"Duration: {body.duration_sec}s")
-        if body.call_id:
-            extra.append(f"CallId: {body.call_id}")
-        if body.recording_url:
-            extra.append(f"Recording: {body.recording_url}")
-        if body.from_number:
-            extra.append(f"From: {body.from_number}")
-        if body.to_number:
-            extra.append(f"To: {body.to_number}")
-        if extra:
-            payload["notes"] = (payload["notes"] + "\n" if payload["notes"] else "") + "\n".join(extra)
-
-        # POST history
-        created_hist = create_history_record(payload)
-
-        # link the contact if we have one
-        if contact_key:
-            # The helper should attach the object if your service implements it,
-            # otherwise, you can expose a second helper in realnex_api.py:
-            # add_object_to_history(historyKey, objectKey)
-            # To keep this router thin, we simply return both keys:
-            created_hist["linkedContactKey"] = contact_key
-
-        return created_hist
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/debug/realnex/resolve_user")
-def debug_resolve_user(email: EmailStr = Query(..., description="RealNex user login email")):
-    try:
-        return resolve_user_and_team(str(email))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@router.post("/contacts", summary="Create contact")
+async def contacts_create(body: SimpleContact):
+    rn_token = get_rn_token()
+    if not rn_token:
+        return {"status": "dry-run", "reason": "REALNEX_JWT/REALNEX_TOKEN not set"}
+    payload = {
+        "FirstName": body.first_name or "",
+        "LastName": body.last_name or "",
+        "Email": body.email or None,
+        "PrimaryPhone": normalize_phone_e164ish(body.phone) if body.phone else None,
+        "Company": body.company or None,
+        "Source": "Goose",
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    return await create_contact(rn_token, payload)
