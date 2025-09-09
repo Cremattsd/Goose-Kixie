@@ -4,7 +4,7 @@ import os, hmac, hashlib, json
 from typing import Optional
 
 from ..services.realnex_api import (
-    normalize_phone_e164ish, search_by_phone, create_contact, create_activity, get_rn_token
+    normalize_phone_e164ish, search_by_phone, create_contact, create_history, get_rn_token
 )
 
 router = APIRouter()
@@ -119,7 +119,7 @@ async def kixie_webhook(request: Request):
     if dry_run:
         return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set","activity":a.model_dump()}
 
-    resp = await create_activity(rn_token, _activity_payload(a))
+    resp = await create_history(rn_token, _activity_payload(a))
     return {"status": resp.get("status"), "realnex": resp, "activity": a.model_dump()}
 
 @router.post("/activities/call")
@@ -127,7 +127,7 @@ async def log_call(activity: CallActivity):
     rn_token = get_rn_token()
     if not rn_token:
         return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set","activity":activity.model_dump()}
-    resp = await create_activity(rn_token, _activity_payload(activity))
+    resp = await create_history(rn_token, _activity_payload(activity))
     return {"status": resp.get("status"), "realnex": resp}
 
 @router.get("/contacts/search")
