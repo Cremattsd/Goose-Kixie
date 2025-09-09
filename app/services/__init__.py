@@ -1,3 +1,1 @@
-cat > app/services/__init__.py <<'PY'
-# Package marker
-PY
+# makes app.services a package

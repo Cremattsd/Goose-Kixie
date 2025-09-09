@@ -70,21 +70,24 @@ async def _ensure_contact_id(rn_token: str, phone_raw: Optional[str]) -> Optiona
         data = created.get("data") or created
         for key in ("Id","id","ContactId","contactId","Key","key"):
             if key in data:
-                return str(data[key])
+                return str(key)
     return None
 
-def _history_payload(a: CallActivity, user_key: Optional[str], team_key: Optional[str]) -> dict:
+def _history_payload(a: CallActivity) -> dict:
     return {
-        "userKey": user_key,
-        "teamKey": team_key,
-        "published": True,
-        "startDate": a.started_at,
-        "endDate": a.ended_at,
-        "timeless": False,
-        "eventTypeKey": 1,
-        "statusKey": 1,
-        "subject": f"Kixie Call {a.direction} - {a.disposition}",
-        "notes": a.notes or f"Call duration {a.duration_sec} sec",
+        "Subject": f"Call {a.direction} - {a.disposition}",
+        "Notes": a.notes or f"Call duration {a.duration_sec} sec",
+        "DurationSeconds": a.duration_sec,
+        "StartedAt": a.started_at,
+        "EndedAt": a.ended_at,
+        "ContactId": a.contact_id,
+        "CompanyId": a.company_id,
+        "OwnerEmail": a.agent_email,
+        "ExternalId": a.call_id,
+        "Source": "Kixie",
+        "IsCompleted": a.is_completed,
+        "ActivityType": "Phone Call",
+        "Result": a.disposition,
     }
 
 @router.post("/webhooks/kixie")
@@ -120,8 +123,7 @@ async def kixie_webhook(request: Request):
     if dry_run:
         return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set","activity":a.model_dump()}
 
-    # Create history log
-    resp = await create_history(rn_token, _history_payload(a, None, None))
+    resp = await create_history(rn_token, _history_payload(a))
     return {"status": resp.get("status"), "realnex": resp, "activity": a.model_dump()}
 
 @router.get("/contacts/search")
@@ -132,8 +134,15 @@ async def contacts_search(phone: str = Query(...)):
     norm = normalize_phone_e164ish(phone)
     return await search_by_phone(rn_token, norm or phone)
 
+class SimpleContactIn(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
+
 @router.post("/contacts")
-async def contacts_create(body: SimpleContact):
+async def contacts_create(body: SimpleContactIn):
     rn_token = get_rn_token()
     if not rn_token:
         return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set"}

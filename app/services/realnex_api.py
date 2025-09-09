@@ -1,4 +1,3 @@
-cat > app/services/realnex_api.py <<'PY'
 import os, httpx, re, asyncio
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -83,7 +82,7 @@ async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
         ["history","History","histories","Histories"],
         token, json=payload)
 
-# ---------- Resolve user/team by email ----------
+# ---------- Resolve user/team by email (optional helpers) ----------
 
 _USER_LIST_PATHS = ["users","Users","CRM/users","CRM/Users"]
 _TEAM_LIST_PATHS = ["teams","Teams","CRM/teams","CRM/Teams"]
@@ -129,33 +128,6 @@ async def _first_ok(method: str, rel_paths: List[str], token: str):
                     continue
     return (None, None)
 
-async def _crm_find_user_team(token: str, email: str):
-    ctx: Dict[str,Any] = {"mode":"crm_lists"}
-    users_url, users_payload = await _first_ok("GET", _USER_LIST_PATHS, token)
-    teams_url, teams_payload = await _first_ok("GET", _TEAM_LIST_PATHS, token)
-    ctx.update({"users_url": users_url, "teams_url": teams_url})
-
-    user_key = team_key = None
-
-    if isinstance(users_payload, list):
-        for u in users_payload:
-            e = _pluck_any(u, _EMAIL_FIELDS)
-            if e and e.lower() == email.lower():
-                user_key = _pluck_any(u, _USER_KEY_FIELDS)
-                team_key = _pluck_any(u, ["TeamKey","teamKey","DefaultTeamKey","defaultTeamKey"]) or team_key
-                ctx["user_match"] = u
-                break
-
-    if not team_key and isinstance(teams_payload, list):
-        for t in teams_payload:
-            owner = _pluck_any(t, ["OwnerEmail","ownerEmail","Email","email"])
-            if owner and owner.lower() == email.lower():
-                team_key = _pluck_any(t, _TEAM_KEY_FIELDS)
-                ctx["team_match"] = t
-                break
-
-    return user_key, team_key, ctx
-
 async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]):
     url = f"{base}/{path}"
     try:
@@ -173,59 +145,6 @@ async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: s
 def _odata_filter(email: str) -> Dict[str,str]:
     conds = [f"{f} eq '{email}'" for f in _EMAIL_FIELDS]
     return {"$filter": " or ".join(conds), "$top": "1"}
-
-async def _odata_find_user_team(token: str, email: str):
-    ctx: Dict[str,Any] = {"mode":"odata"}
-    params = _odata_filter(email)
-    async with _client() as client:
-        user_obj = None
-        for base in BASES:
-            for coll in _ODATA_USER_COLLECTIONS:
-                u = await _odata_first(client, base, coll, token, params)
-                if u:
-                    user_obj = u; break
-            if user_obj: break
-
-        user_key = team_key = None
-        if user_obj:
-            user_key = _pluck_any(user_obj, _USER_KEY_FIELDS)
-            team_key = _pluck_any(user_obj, ["TeamKey","teamKey","DefaultTeamKey","defaultTeamKey"]) or None
-
-        if not team_key:
-            team_obj = None
-            for base in BASES:
-                for coll in _ODATA_TEAM_COLLECTIONS:
-                    t = await _odata_first(client, base, coll, token, {
-                        "$top":"1",
-                        "$filter": " or ".join([f"OwnerEmail eq '{email}'", f"Email eq '{email}'", f"email eq '{email}'"])
-                    })
-                    if t:
-                        team_obj = t; break
-                if team_obj: break
-            if team_obj:
-                team_key = _pluck_any(team_obj, _TEAM_KEY_FIELDS)
-
-    ctx.update({"userKey": user_key, "teamKey": team_key})
-    return user_key, team_key, ctx
-
-async def resolve_user_team_by_email(token: str, email: str):
-    k = _cache_key(email)
-    async with _user_lock:
-        if k in _user_cache:
-            uk, tk = _user_cache[k]
-            return uk, tk, {"cached": True}
-
-    uk, tk, ctx1 = await _crm_find_user_team(token, email)
-    if not uk or not tk:
-        uk2, tk2, ctx2 = await _odata_find_user_team(token, email)
-        uk = uk or uk2; tk = tk or tk2
-        ctx = {"crm": ctx1, "odata": ctx2}
-    else:
-        ctx = {"crm": ctx1}
-
-    async with _user_lock:
-        _user_cache[k] = (uk, tk)
-    return uk, tk, ctx
 
 async def probe_endpoints(token: str) -> Dict[str, Any]:
     shapes = [
@@ -245,4 +164,3 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
                 except Exception as e:
                     out["checks"].append({"url": url, "error": str(e)})
     return out
-PY
