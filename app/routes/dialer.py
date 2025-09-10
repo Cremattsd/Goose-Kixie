@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Request, HTTPException, Query
 import os, hmac, hashlib, re
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Union
+from typing import Optional, Union, List
+from zoneinfo import ZoneInfo
 
 from ..schemas.kixie import KixieWebhook, SimpleContact
 from ..services.realnex_api import (
@@ -42,14 +43,23 @@ def _str_or_none(x: Optional[str]) -> Optional[str]:
     x = x.strip()
     return x or None
 
+def _default_tz() -> ZoneInfo:
+    # set RN_DEFAULT_TZ=America/Los_Angeles to match your office
+    tzname = os.getenv("RN_DEFAULT_TZ", "UTC")
+    try:
+        return ZoneInfo(tzname)
+    except Exception:
+        return ZoneInfo("UTC")
+
 def _parse_dt(x: Union[str, int, float, datetime, None]) -> Optional[datetime]:
-    """Robust parse: ISO8601 with offset/Z, datetime, or epoch seconds."""
+    """Robust parse: ISO8601 with offset/Z, datetime, or epoch seconds.
+       If naive, assume RN_DEFAULT_TZ (then convert to UTC later)."""
     if x is None:
         return None
     if isinstance(x, datetime):
-        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
+        return x if x.tzinfo else x.replace(tzinfo=_default_tz())
     if isinstance(x, (int, float)):
-        return datetime.fromtimestamp(x, tz=timezone.utc)
+        return datetime.fromtimestamp(x, tz=_default_tz())
     if isinstance(x, str):
         s = x.strip()
         if not s:
@@ -58,7 +68,7 @@ def _parse_dt(x: Union[str, int, float, datetime, None]) -> Optional[datetime]:
             s = s[:-1] + "+00:00"
         try:
             dt = datetime.fromisoformat(s)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            return dt if dt.tzinfo else dt.replace(tzinfo=_default_tz())
         except Exception:
             return None
     return None
@@ -116,8 +126,8 @@ async def contacts_create(body: SimpleContact):
 @router.post("/webhooks/kixie")
 async def kixie_webhook(payload: KixieWebhook, request: Request):
     """
-    Receives Kixie webhook, resolves RN user/team, finds/creates contact,
-    and posts a History. Handles ISO/Z/epoch datetimes and derives missing times.
+    Receives Kixie webhook, resolves RN user/team, finds/creates contact by PHONE,
+    and posts a History. Handles ISO/Z/epoch datetimes; naive times use RN_DEFAULT_TZ.
     """
     # 1) HMAC (optional)
     raw = await request.body()
@@ -134,19 +144,21 @@ async def kixie_webhook(payload: KixieWebhook, request: Request):
     if not user_key:
         raise HTTPException(status_code=500, detail="Unable to resolve userKey from RealNex")
 
-    # 3) Customer phone (direction-aware)
+    # 3) Customer phone (direction-aware) — PHONE determines the contact
     direction = (payload.direction or "outbound").lower()
     customer_num = payload.to_number if direction == "outbound" else payload.from_number
     if not customer_num:
         raise HTTPException(status_code=500, detail="No customer phone found in payload")
 
-    # 4) Contact
+    # 4) Contact by phone (create if missing)
     contact_res = await get_or_create_contact_by_phone(rn_token, customer_num, team_key=team_key)
     contact_key = contact_res.get("contactKey")
     if not contact_key:
         raise HTTPException(status_code=500, detail={"error": "Unable to resolve contactKey", "contact": contact_res})
 
-    # 5) Time math (robust)
+    link_pref: List[str] = contact_res.get("link_preference") or ["contactKey","leadKey","partyKey","linkedTo"]
+
+    # 5) Time math with TZ handling
     start_dt = _parse_dt(payload.started_at)
     end_dt = _parse_dt(payload.ended_at)
     dur = payload.duration_sec or 0
@@ -156,7 +168,9 @@ async def kixie_webhook(payload: KixieWebhook, request: Request):
     if not end_dt and start_dt and dur:
         end_dt = start_dt + timedelta(seconds=dur)
     if not start_dt and not end_dt:
-        end_dt = datetime.now(timezone.utc)
+        # default now in configured TZ, then UTC
+        now_local = datetime.now(_default_tz())
+        end_dt = now_local
         start_dt = end_dt - timedelta(seconds=dur) if dur else end_dt
 
     start_utc = _to_utc_z(start_dt)
@@ -176,7 +190,7 @@ async def kixie_webhook(payload: KixieWebhook, request: Request):
     env_proj = _str_or_none(os.getenv("RN_PROJECT_KEY"))
     project_key: Optional[str] = env_proj if _looks_like_guid(env_proj) else None
 
-    # 8) Build History body
+    # 8) Build History body (service layer will add the correct link field)
     history_body = {
         "userKey": user_key,
         "published": True,
@@ -198,13 +212,14 @@ async def kixie_webhook(payload: KixieWebhook, request: Request):
     if project_key:
         history_body["projectKey"] = project_key
 
-    # 9) Post History
-    rn_resp = await post_history_for_contact(rn_token, contact_key, history_body)
+    # 9) Post History with Contact-first linking
+    rn_resp = await post_history_for_contact(rn_token, contact_key, history_body, preferred_fields=link_pref)
 
-    # 10) Response
+    # 10) Response (mirror RN)
+    link_field_used = rn_resp.get("link_field") if isinstance(rn_resp, dict) else None
     return {
         "status": rn_resp.get("status", 200) if isinstance(rn_resp, dict) else 200,
-        "link_field": os.getenv("RN_HISTORY_CONTACT_LINK_FIELD", "contactKey"),
+        "link_field": link_field_used,
         "resolved": resolved,
         "contactKey": contact_key,
         "history_post_body": history_body,
