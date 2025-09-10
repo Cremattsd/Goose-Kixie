@@ -42,10 +42,6 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
 
 async def _format_resp(resp: httpx.Response) -> Any:
-    """
-    Return JSON (dict OR list). If JSON is not parseable, return a tiny dict.
-    For dict payloads, we also attach status/url/method keys.
-    """
     try:
         data = resp.json() if resp.content else {}
     except Exception:
@@ -66,11 +62,6 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **
     return await client.send(req)
 
 async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Any:
-    """
-    Try the given relative paths across all discovered BASES until one returns non-404.
-    Return the formatted response of the first non-404, otherwise the last one.
-    Can return dict OR list depending on the endpoint.
-    """
     async with _client() as client:
         last = None
         for base in BASES:
@@ -88,10 +79,6 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Any:
 # ========= URL join helper for OData =========
 
 def _join_base_path(base: str, path: str) -> str:
-    """
-    Join base and relative path but avoid duplicate segments like:
-      base=.../CrmOData  path=CrmOData/Users  -> .../CrmOData/Users
-    """
     base = base.rstrip("/")
     path = path.lstrip("/")
     if not path:
@@ -105,7 +92,6 @@ def _join_base_path(base: str, path: str) -> str:
 # ========= Phone utils =========
 
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
-    """Return +E164-ish, e.g., +16195551234. None if no digits."""
     if not raw: return None
     digits = re.sub(r"\D+", "", raw)
     if not digits: return None
@@ -115,7 +101,6 @@ def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     return f"+{digits}"
 
 def _phone_formats(raw: Optional[str]) -> Dict[str, Optional[str]]:
-    """Return multiple formats for matching (E164 and last10)."""
     e164 = normalize_phone_e164ish(raw)
     digits = re.sub(r"\D+", "", raw or "")
     last10 = digits[-10:] if len(digits) >= 10 else digits or None
@@ -171,15 +156,22 @@ async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: s
     url = _join_base_path(base, path)
     try:
         r = await _send(client, "GET", url, token, params=params)
-        if r.status_code == 404:
+        # Treat any 4xx/5xx as "no result" (avoid bubbling error dicts)
+        if r.status_code >= 400:
             return None
         data = await _format_resp(r)
         if isinstance(data, dict) and isinstance(data.get("value"), list) and data["value"]:
             return data["value"][0]
+        # Some tenants return a single object
         if isinstance(data, dict):
+            if "error" in data:
+                return None
             body_keys = {"status","url","method"}
             d = {k:v for k,v in data.items() if k not in body_keys}
             return d or None
+        # Some return bare lists
+        if isinstance(data, list) and data:
+            return data[0]
         return None
     except httpx.HTTPError:
         return None
@@ -230,46 +222,47 @@ async def list_teams(token: str) -> List[Dict[str, Any]]:
 
 async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str,Any]]:
     ph = _phone_formats(raw_phone)
+
+    # 1) Tenant-specific search endpoints first (most reliable)
+    if ph["e164"]:
+        rest1 = await search_by_phone(token, ph["e164"])
+        items = _as_list_from_search_result(rest1)
+        if items:
+            return items[0]
+    if ph["last10"]:
+        rest2 = await search_by_phone(token, ph["last10"])
+        items = _as_list_from_search_result(rest2)
+        if items:
+            return items[0]
+
+    # 2) OData Contacts — try SIMPLE fields one-by-one (no Phones/any)
+    simple_fields = [
+        "Phone", "MobilePhone", "PrimaryPhone", "PrimaryPhoneNumber",
+        "BusinessPhone", "WorkPhone", "HomePhone"
+    ]
+    candidates: List[str] = []
+    if ph["e164"]:
+        candidates += [f"{f} eq '{ph['e164']}'" for f in simple_fields]
+    if ph["last10"]:
+        candidates += [f"{f} eq '{ph['last10']}'" for f in simple_fields]
+    # Try Phones/any last, only if others fail (some tenants support it)
+    if ph["e164"]:
+        candidates.append(f"Phones/any(p: p/Number eq '{ph['e164']}')")  # may 400 on some tenants
+    if ph["last10"]:
+        candidates.append(f"Phones/any(p: p/Number eq '{ph['last10']}')")
+
     async with _client() as client:
-        if ph["e164"]:
-            rest1 = await _try_paths(
-                "GET",
-                ["Contacts/search","Contact/search","contacts/search","contact/search"],
-                token,
-                params={"phone": ph["e164"]}
-            )
-            items = _as_list_from_search_result(rest1)
-            if items:
-                return items[0]
-        if ph["last10"]:
-            rest2 = await _try_paths(
-                "GET",
-                ["Contacts/search","Contact/search","contacts/search","contact/search"],
-                token,
-                params={"phone": ph["last10"]}
-            )
-            items = _as_list_from_search_result(rest2)
-            if items:
-                return items[0]
         for base in BASES:
             for coll in _ODATA_CONTACT_COLLECTIONS:
-                conds = []
-                if ph["e164"]:
-                    conds += [
-                        f"Phones/any(p: p/Number eq '{ph['e164']}')",
-                        f"MobilePhone eq '{ph['e164']}'",
-                        f"Phone eq '{ph['e164']}'",
-                    ]
-                if ph["last10"]:
-                    conds += [
-                        f"Phones/any(p: p/Number eq '{ph['last10']}')",
-                        f"MobilePhone eq '{ph['last10']}'",
-                        f"Phone eq '{ph['last10']}'",
-                    ]
-                params = {"$filter": " or ".join(conds), "$top": "1"}
-                found = await _odata_first(client, base, coll, token, params)
-                if found:
-                    return found
+                for filt in candidates:
+                    params = {"$filter": filt, "$top": "1"}
+                    found = await _odata_first(client, base, coll, token, params)
+                    if isinstance(found, dict) and "error" in found:
+                        # treat as miss, continue trying
+                        continue
+                    if found:
+                        return found
+
     return None
 
 async def get_or_create_contact_by_phone(
@@ -280,22 +273,34 @@ async def get_or_create_contact_by_phone(
     last_name: str = "Unknown"
 ) -> Dict[str,Any]:
     existing = await find_contact_by_phone(token, raw_phone)
-    if existing:
-        return {"created": False, "contact": existing, "contactKey": extract_contact_key(existing)}
+    # Only accept as found if we can extract a real key
+    if isinstance(existing, dict):
+        key = extract_contact_key(existing)
+        if key:
+            return {"created": False, "contact": existing, "contactKey": key}
+
     ph = _phone_formats(raw_phone)
     number = ph["e164"] or ph["last10"]
     if not number:
         return {"created": False, "error": "No phone digits"}
+
     payload = {
         "FirstName": first_name,
         "LastName": last_name,
-        "Published": True
+        "Published": True,
+        "Phones": [{"Number": number, "Type": "Mobile"}],
     }
     if team_key:
         payload["TeamKey"] = team_key
-    payload["Phones"] = [{"Number": number, "Type": "Mobile"}]
+
     created = await create_contact(token, payload)
-    key = extract_contact_key(created if isinstance(created, dict) else {})
+    # created may be dict with id fields at top-level or nested
+    key = None
+    if isinstance(created, dict):
+        key = extract_contact_key(created)
+        if not key and isinstance(created.get("data"), dict):
+            key = extract_contact_key(created["data"])
+
     return {"created": True, "contact": created, "contactKey": key}
 
 async def post_history_for_contact(
@@ -335,10 +340,6 @@ def _b64url_pad(s: str) -> str:
     return s + "=" * ((4 - len(s) % 4) % 4)
 
 def parse_jwt_noverify(jwt: str) -> Dict[str, Any]:
-    """
-    Parse JWT payload without verifying signature (we don't have RN secret).
-    Good enough to extract email/user_key hints.
-    """
     try:
         parts = jwt.split(".")
         if len(parts) < 2:
@@ -349,31 +350,18 @@ def parse_jwt_noverify(jwt: str) -> Dict[str, Any]:
         return {}
 
 async def resolve_rn_context(token: str) -> Dict[str, Any]:
-    """
-    Resolve user/team from JWT claims + OData. If OData is unavailable,
-    fall back to CRM /Users and /Teams, preferring the user's Private team
-    (often teamKey == userKey in RealNex).
-    """
     payload = parse_jwt_noverify(token)
     email = payload.get("email") or payload.get("sub") or None
     jwt_user_key = payload.get("user_key") or payload.get("userKey") or None
 
-    result: Dict[str, Any] = {
-        "email": email,
-        "user_key": jwt_user_key,
-        "team_key": None,
-        "sources": [],
-    }
+    result: Dict[str, Any] = {"email": email, "user_key": jwt_user_key, "team_key": None, "sources": []}
     if jwt_user_key:
         result["sources"].append("jwt")
 
-    # helper: pull any *TeamKey-like field or first team ref from user object
     def _extract_team_from_user(u: Dict[str, Any]) -> Optional[str]:
-        # direct fields
         for f in list(u.keys()):
             if f.lower().endswith("teamkey") and u.get(f):
                 return str(u[f])
-        # nested Teams arrays (various shapes)
         for f in ("Teams", "teams", "UserTeams", "userTeams"):
             val = u.get(f)
             if isinstance(val, list) and val:
@@ -384,7 +372,6 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                             return str(first[k])
         return None
 
-    # --- Primary path: OData (if available) ---
     async with _client() as client:
         if email:
             for base in BASES:
@@ -405,8 +392,8 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
         if result["user_key"] and not result["team_key"]:
             uk = result["user_key"]
             membership_filters = [
-                f"Users/any(u: u/Key eq '{uk}')",     # common
-                f"Members/any(u: u/Key eq '{uk}')"     # some tenants
+                f"Users/any(u: u/Key eq '{uk}')",
+                f"Members/any(u: u/Key eq '{uk}')"
             ]
             for base in BASES:
                 for coll in _ODATA_TEAM_COLLECTIONS:
@@ -424,28 +411,24 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                 if result["team_key"]:
                     break
 
-    # --- Fallback path: CRM lists (no OData on tenant) ---
+    # Fallback to CRM lists if still no team
     if result["user_key"] and not result["team_key"]:
-        # Fetch lists
-        users = await list_users(token)   # [{'key','userId','userName','loginName','active'}, ...]
-        teams = await list_teams(token)   # [{'key','name'}, ...]
+        users = await list_users(token)
+        teams = await list_teams(token)
         uk = result["user_key"]
 
-        # Find matching user record (optional; for display name)
         uname = None
         for u in users:
             if str(u.get("key")) == uk:
                 uname = u.get("userName") or u.get("loginName") or None
                 break
 
-        # Prefer team whose key equals user key (common "Private (Name)" mapping)
         for t in teams:
             if str(t.get("key")) == uk:
                 result["team_key"] = uk
                 result["sources"].append("crm_teams_key_equals_userkey")
                 break
 
-        # Else look for "Private (UserName)"
         if not result["team_key"] and uname:
             private_name = f"Private ({uname})"
             for t in teams:
@@ -454,7 +437,6 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                     result["sources"].append("crm_teams_private_name")
                     break
 
-        # Else fuzzy contains user's name
         if not result["team_key"] and uname:
             low = uname.lower()
             for t in teams:
