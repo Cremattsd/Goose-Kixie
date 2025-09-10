@@ -1,173 +1,81 @@
-# routes/dialer.py
+# app/routes/dialer.py
 from fastapi import APIRouter, Request, HTTPException, Query
-import os, hmac, hashlib
-from typing import Optional, Dict, Any
+import os, hmac, hashlib, re
 from datetime import datetime, timezone
+from typing import Optional
 
 from ..schemas.kixie import KixieWebhook, SimpleContact
 from ..services.realnex_api import (
     get_rn_token,
+    resolve_rn_context,
     get_or_create_contact_by_phone,
     post_history_for_contact,
     normalize_phone_e164ish,
     search_by_phone,
     create_contact,
-    resolve_rn_context,   # NEW
 )
 
 router = APIRouter()
 
-# ---- Env / Config ----
-RN_PROJECT_KEY = os.getenv("RN_PROJECT_KEY")                 # Optional
-RN_EVENT_TYPE_PHONE = int(os.getenv("RN_EVENT_TYPE_PHONE", "1"))
-RN_STATUS_COMPLETED = int(os.getenv("RN_STATUS_COMPLETED", "0"))
-RN_HISTORY_CONTACT_LINK_FIELD = os.getenv("RN_HISTORY_CONTACT_LINK_FIELD", "contactKey")
+# ---------- Utilities ----------
 
-KIXIE_SIGNATURE_HEADER = os.getenv("KIXIE_SIGNATURE_HEADER", "X-Kixie-Signature")
-KIXIE_WEBHOOK_SECRET = os.getenv("KIXIE_WEBHOOK_SECRET")  # optional HMAC secret
+def _verify_kixie_signature(raw: bytes, header_sig: Optional[str]) -> None:
+    """Enforce HMAC if KIXIE_WEBHOOK_SECRET is set."""
+    secret = os.getenv("KIXIE_WEBHOOK_SECRET")
+    if not secret:
+        return  # no enforcement in dev
+    if not header_sig:
+        raise HTTPException(status_code=401, detail="Missing signature")
+    calc = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, header_sig):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
+def _looks_like_guid(s: Optional[str]) -> bool:
+    return bool(s and _UUID_RE.match(s))
+
+def _to_utc_z(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return None
+
+def _str_or_none(x: Optional[str]) -> Optional[str]:
+    if not x:
+        return None
+    x = x.strip()
+    return x or None
+
+# ---------- Health & debug ----------
 
 @router.get("/health/realnex")
 async def health_realnex():
     token = get_rn_token()
-    if not token:
-        return {"has_jwt": False}
-    ctx = await resolve_rn_context(token)
+    has = bool(token)
+    resolved = {}
+    if has:
+        resolved = await resolve_rn_context(token)
     return {
-        "has_jwt": True,
-        "resolved_user_key": bool(ctx.get("user_key")),
-        "resolved_team_key": bool(ctx.get("team_key")),
-        "sources": ctx.get("sources", []),
-        "email": ctx.get("email"),
+        "has_jwt": has,
+        "resolved_user_key": bool(resolved.get("user_key")),
+        "resolved_team_key": bool(resolved.get("team_key")),
+        "sources": resolved.get("sources") or [],
+        "email": resolved.get("email"),
     }
 
-def _verify_kixie_signature(raw: bytes, header_sig: Optional[str]) -> None:
-    if not KIXIE_WEBHOOK_SECRET:
-        return
-    if not header_sig:
-        raise HTTPException(status_code=401, detail="Missing signature")
-    calc = hmac.new(KIXIE_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc, header_sig):
-        raise HTTPException(status_code=401, detail="Invalid signature")
+# ---------- Contacts helper endpoints (unchanged) ----------
 
-def _to_utc_ms(iso_or_dt: Optional[str | datetime]) -> Optional[str]:
-    if iso_or_dt is None:
-        return None
-    if isinstance(iso_or_dt, datetime):
-        dt = iso_or_dt
-    else:
-        s = iso_or_dt
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-def _subject(a: KixieWebhook) -> str:
-    try:
-        return a.subject()
-    except Exception:
-        disp = (a.disposition or "").strip() or "Unknown"
-        direction = (a.direction or "outbound").strip()
-        return f"Call {direction} - {disp}"
-
-def _notes(a: KixieWebhook) -> str:
-    try:
-        return a.notes()
-    except Exception:
-        lines = [
-            f"Kixie {a.event} • {a.duration_sec or 0}s",
-            f"From: {a.from_number or 'n/a'} → To: {a.to_number or 'n/a'}",
-            f"Agent: {a.agent_email or 'n/a'}",
-            f"Recording: {a.recording_url or 'n/a'}",
-            f"Call ID: {a.call_id or 'n/a'}",
-        ]
-        return "\n".join(lines)
-
-def _start_utc(a: KixieWebhook) -> Optional[str]:
-    try:
-        return a.start_utc_ms()
-    except Exception:
-        return _to_utc_ms(getattr(a, "started_at", None))
-
-def _end_utc(a: KixieWebhook) -> Optional[str]:
-    try:
-        return a.end_utc_ms()
-    except Exception:
-        return _to_utc_ms(getattr(a, "ended_at", None))
-
-def _history_payload(a: KixieWebhook, user_key: str, team_key: str) -> Dict[str, Any]:
-    payload = {
-        "userKey": user_key,
-        "teamKey": team_key,
-        "projectKey": RN_PROJECT_KEY,
-        "published": True,
-        "timeless": False,
-        "startDate": _start_utc(a),
-        "endDate": _end_utc(a),
-        "eventTypeKey": RN_EVENT_TYPE_PHONE,
-        "statusKey": RN_STATUS_COMPLETED,
-        "subject": _subject(a),
-        "notes": _notes(a),
-        "user1": "Kixie",
-        "user2": a.event,
-        "user3": a.disposition,
-        "user4": a.direction,
-        "logical1": True,
-    }
-    return {k: v for k, v in payload.items() if v is not None}
-
-@router.post("/webhooks/kixie")
-async def kixie_webhook(payload: KixieWebhook, request: Request):
-    raw = await request.body()
-    _verify_kixie_signature(raw, request.headers.get(KIXIE_SIGNATURE_HEADER))
-
-    rn_token = get_rn_token()
-    if not rn_token:
-        return {
-            "status": "dry-run",
-            "reason": "REALNEX_TOKEN/REALNEX_JWT not set",
-            "history_body": _history_payload(payload, user_key="(unset)", team_key="(unset)"),
-        }
-
-    # 🔑 Resolve user/team from JWT + OData (no .env needed)
-    ctx = await resolve_rn_context(rn_token)
-    user_key, team_key = ctx.get("user_key"), ctx.get("team_key")
-    if not user_key or not team_key:
-        raise HTTPException(status_code=502, detail={"error": "Could not resolve user/team from JWT/OData", "context": ctx})
-
-    # 1) Find/create contact
-    target_raw = payload.to_number if (payload.direction or "outbound").lower() == "outbound" else payload.from_number
-    contact_res = await get_or_create_contact_by_phone(
-        rn_token,
-        target_raw or "",
-        team_key=team_key,
-        first_name="Kixie",
-        last_name="Unknown",
-    )
-    contact_key = contact_res.get("contactKey")
-    if not contact_key:
-        raise HTTPException(status_code=502, detail={"error": "Unable to resolve contactKey", "contact": contact_res})
-
-    # 2) Build History payload (with resolved user/team)
-    history_body = _history_payload(payload, user_key=user_key, team_key=team_key)
-
-    # 3) Attach to contact + POST
-    rn_resp = await post_history_for_contact(rn_token, contact_key, history_body)
-
-    return {
-        "status": rn_resp.get("status"),
-        "link_field": RN_HISTORY_CONTACT_LINK_FIELD,
-        "resolved": {"email": ctx.get("email"), "user_key": user_key, "team_key": team_key, "sources": ctx.get("sources", [])},
-        "contactKey": contact_key,
-        "history_post_body": {**history_body, RN_HISTORY_CONTACT_LINK_FIELD: contact_key},
-        "realnex": rn_resp,
-    }
-
-# --- Helpers for manual testing ---
 @router.get("/contacts/search")
 async def contacts_search(phone: str = Query(..., description="Phone number to search (any format)")):
     rn_token = get_rn_token()
     if not rn_token:
-        return {"status":"dry-run","reason":"REALNEX_TOKEN not set"}
+        return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set"}
     norm = normalize_phone_e164ish(phone)
     return await search_by_phone(rn_token, norm or phone)
 
@@ -175,14 +83,110 @@ async def contacts_search(phone: str = Query(..., description="Phone number to s
 async def contacts_create(body: SimpleContact):
     rn_token = get_rn_token()
     if not rn_token:
-        return {"status":"dry-run","reason":"REALNEX_TOKEN not set"}
+        return {"status":"dry-run","reason":"REALNEX_JWT/REALNEX_TOKEN not set"}
     payload = {
         "FirstName": body.first_name or "",
         "LastName": body.last_name or "",
-        "Email": body.email or None,
+        "Email": _str_or_none(body.email),
         "PrimaryPhone": normalize_phone_e164ish(body.phone) if body.phone else None,
-        "Company": body.company or None,
+        "Company": _str_or_none(body.company),
         "Source": "Goose",
     }
     payload = {k: v for k, v in payload.items() if v is not None}
     return await create_contact(rn_token, payload)
+
+# ---------- Kixie Webhook ----------
+
+@router.post("/webhooks/kixie")
+async def kixie_webhook(payload: KixieWebhook, request: Request):
+    """
+    Receives Kixie webhook, resolves RN user/team, finds/creates contact,
+    and posts a History. Omits projectKey when empty or not a GUID.
+    """
+    # 1) optional HMAC verify
+    raw = await request.body()
+    _verify_kixie_signature(raw, request.headers.get("X-Kixie-Signature"))
+
+    # 2) RN context (user/team)
+    rn_token = get_rn_token()
+    if not rn_token:
+        raise HTTPException(status_code=500, detail="REALNEX_JWT/REALNEX_TOKEN not set")
+
+    resolved = await resolve_rn_context(rn_token)
+    user_key = resolved.get("user_key")
+    team_key = resolved.get("team_key")
+    if not user_key:
+        raise HTTPException(status_code=500, detail="Unable to resolve userKey from RealNex")
+    if not team_key:
+        # We can still log history w/out team in many tenants, but better to surface it.
+        # Continue anyway; omit teamKey if missing.
+        pass
+
+    # 3) Determine the customer phone (depends on direction)
+    customer_num = payload.to_number if (payload.direction or "outbound").lower() == "outbound" else payload.from_number
+    if not customer_num:
+        raise HTTPException(status_code=500, detail="No customer phone found in payload")
+
+    # 4) Find or create contact
+    contact_res = await get_or_create_contact_by_phone(rn_token, customer_num, team_key=team_key)
+    contact_key = contact_res.get("contactKey")
+    if not contact_key:
+        raise HTTPException(status_code=500, detail={"error": "Unable to resolve contactKey", "contact": contact_res})
+
+    # 5) Build History body (RealNex History model)
+    #    Convert start/end to UTC Z; if start is missing, derive from end - duration
+    start_utc = _to_utc_z(payload.started_at)
+    end_utc = _to_utc_z(payload.ended_at) or start_utc
+
+    # Subject & notes
+    direction = (payload.direction or "unknown").lower()
+    subject = f"Call {direction} - {payload.disposition or 'Unknown'}"
+    notes = (
+        f"Kixie {payload.event or 'event'} • {payload.duration_sec or 0}s\n"
+        f"From: {payload.from_number or ''} → To: {payload.to_number or ''}\n"
+        f"Agent: {payload.agent_email or ''}\n"
+        f"Recording: {payload.recording_url or ''}\n"
+        f"Call ID: {payload.call_id or ''}"
+    )
+
+    # Safe projectKey (omit unless valid GUID or env provided and valid)
+    env_proj = _str_or_none(os.getenv("RN_PROJECT_KEY"))
+    project_key: Optional[str] = env_proj if _looks_like_guid(env_proj) else None
+
+    # Base body
+    history_body = {
+        "userKey": user_key,
+        "published": True,
+        "timeless": False,
+        "startDate": start_utc or end_utc,
+        "endDate": end_utc or start_utc,
+        "eventTypeKey": int(os.getenv("RN_EVENTTYPEKEY_CALL", os.getenv("RN_EVENTTYPEKEY_DEFAULT", "1"))),
+        "statusKey": int(os.getenv("RN_STATUSKEY_DEFAULT", "0")),
+        "subject": subject,
+        "notes": notes,
+        # metadata slots for QA/filters
+        "user1": "Kixie",
+        "user2": payload.event or "",
+        "user3": payload.disposition or "",
+        "user4": payload.direction or "",
+        "logical1": True,
+    }
+    # only include team if we have it
+    if team_key:
+        history_body["teamKey"] = team_key
+    # only include projectKey if it's a real GUID
+    if project_key:
+        history_body["projectKey"] = project_key
+
+    # 6) Post History, linking to contact via services layer (uses RN_HISTORY_CONTACT_LINK_FIELD)
+    rn_resp = await post_history_for_contact(rn_token, contact_key, history_body)
+
+    # 7) Return composite view for debugging
+    return {
+        "status": rn_resp.get("status", 200) if isinstance(rn_resp, dict) else 200,
+        "link_field": os.getenv("RN_HISTORY_CONTACT_LINK_FIELD", "contactKey"),
+        "resolved": resolved,
+        "contactKey": contact_key,
+        "history_post_body": history_body,
+        "realnex": rn_resp,
+    }
