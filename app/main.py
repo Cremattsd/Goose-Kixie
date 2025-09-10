@@ -12,13 +12,11 @@ from fastapi.routing import APIRoute
 from .routes.dialer import router as dialer_router
 try:
     from .routes.debug_realnex import router as debug_router
-except Exception:  # optional debug router
+except Exception:  # optional in case the debug route isn't present
     from fastapi import APIRouter
     debug_router = APIRouter()
 
-# -----------------------------------------------------------------------------
-# App setup
-# -----------------------------------------------------------------------------
+# ── App setup ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("goose-kixie")
 
@@ -33,7 +31,7 @@ app = FastAPI(
     openapi_tags=TAGS,
 )
 
-# CORS (optional, helpful for local tools / Swagger in browsers)
+# CORS (dev-friendly; tighten in prod)
 allow_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +41,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Trusted hosts (optional, tighten in prod)
+# Trusted hosts (fixes your syntax error; keep the full argument name)
 trusted_hosts = [h.strip() for h in os.getenv("TRUSTED_HOSTS", "*").split(",")]
-app.add_middleware(TrustedHostMiddleware, allowed_ho
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+
+# ── Root + health ───────────────────────────────────────────────────────────
+@app.get("/", tags=["debug"])
+def root():
+    """Dynamic route index so it never goes stale."""
+    routes = []
+    for r in app.routes:
+        if isinstance(r, APIRoute):
+            methods = sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"})
+            routes.append({"path": r.path, "methods": methods, "name": r.name})
+    routes.sort(key=lambda x: x["path"])
+    return {"ok": True, "routes": routes}
+
+@app.get("/health", tags=["debug"])
+def health():
+    return {"ok": True}
+
+# ── Wire routers ────────────────────────────────────────────────────────────
+app.include_router(dialer_router, tags=["dialer"])
+app.include_router(debug_router, tags=["debug"])
+
+# ── Startup sanity logs ─────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _startup_log():
+    rn_token_present = bool(os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN"))
+    logger.info("Goose-Kixie starting…")
+    logger.info("REALNEX token present: %s", rn_token_present)
+    logger.info("REALNEX_API_BASE: %s", os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm"))
