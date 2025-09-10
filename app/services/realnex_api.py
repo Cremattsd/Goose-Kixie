@@ -7,11 +7,6 @@ def get_rn_token() -> str:
     return os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN") or ""
 
 def _bases_from_env() -> List[str]:
-    """
-    REALNEX_API_BASE can be a comma-separated list, or a single base like:
-      https://sync.realnex.com/api/v1/Crm
-    We derive sensible variants for CrmOData/CRM/crmodata automatically.
-    """
     raw = os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm")
     parts = [p.strip().rstrip("/") for p in raw.split(",") if p.strip()]
     if len(parts) == 1:
@@ -102,7 +97,7 @@ def _phone_formats(raw: Optional[str]) -> Dict[str, Optional[str]]:
     last10 = digits[-10:] if len(digits) >= 10 else digits or None
     return {"e164": e164, "last10": last10, "digits": digits or None}
 
-# ========= Core endpoints (generic wrappers) =========
+# ========= Core endpoints =========
 
 async def search_by_phone(token: str, phone_e164: str) -> Any:
     return await _try_paths(
@@ -131,8 +126,7 @@ async def create_history(token: str, payload: Dict[str, Any]) -> Any:
 # ========= OData helpers =========
 
 _ODATA_CONTACT_COLLECTIONS = [
-    "CrmOData/Contacts", "crmodata/Contacts",
-    "OData/Contacts", "odata/Contacts",
+    "CrmOData/Contacts", "crmodata/Contacts", "OData/Contacts", "odata/Contacts",
 ]
 _ODATA_USER_COLLECTIONS = [
     "CrmOData/Users", "CrmOData/users", "crmodata/Users", "crmodata/users",
@@ -146,6 +140,7 @@ _ODATA_TEAM_COLLECTIONS = [
 _USER_KEY_FIELDS = ["Key","Id","id","UserKey","userKey","UserId","userId"]
 _TEAM_KEY_FIELDS = ["TeamKey","teamKey","Key","Id","id"]
 _EMAIL_FIELDS = ["Email","email","UserEmail","Username","username","Login","login"]
+_TZ_FIELDS = ["timeZone","timezone","TimeZone","TZ","tz"]
 
 async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]):
     url = _join_base_path(base, path)
@@ -210,44 +205,31 @@ async def list_teams(token: str) -> List[Dict[str, Any]]:
     resp = await _try_paths("GET", ["Teams","teams","CRM/Teams","CRM/teams"], token)
     return resp if isinstance(resp, list) else _as_list_from_search_result(resp)
 
-# ========= High-level helpers =========
+# ========= Find/Create contact by phone =========
 
 async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str,Any]]:
     ph = _phone_formats(raw_phone)
-
-    # 1) Tenant search first
     if ph["e164"]:
         rest1 = await search_by_phone(token, ph["e164"])
         items = _as_list_from_search_result(rest1)
-        if items:
-            return items[0]
+        if items: return items[0]
     if ph["last10"]:
         rest2 = await search_by_phone(token, ph["last10"])
         items = _as_list_from_search_result(rest2)
-        if items:
-            return items[0]
+        if items: return items[0]
 
-    # 2) OData simple fields, no Phones/any unless last resort
-    simple_fields = [
-        "Phone", "MobilePhone", "PrimaryPhone", "PrimaryPhoneNumber",
-        "BusinessPhone", "WorkPhone", "HomePhone"
-    ]
+    simple_fields = ["Phone","MobilePhone","PrimaryPhone","PrimaryPhoneNumber","BusinessPhone","WorkPhone","HomePhone"]
     candidates: List[str] = []
-    if ph["e164"]:
-        candidates += [f"{f} eq '{ph['e164']}'" for f in simple_fields]
-    if ph["last10"]:
-        candidates += [f"{f} eq '{ph['last10']}'" for f in simple_fields]
-    if ph["e164"]:
-        candidates.append(f"Phones/any(p: p/Number eq '{ph['e164']}')")
-    if ph["last10"]:
-        candidates.append(f"Phones/any(p: p/Number eq '{ph['last10']}')")
+    if ph["e164"]:  candidates += [f"{f} eq '{ph['e164']}'"  for f in simple_fields]
+    if ph["last10"]: candidates += [f"{f} eq '{ph['last10']}'" for f in simple_fields]
+    if ph["e164"]:  candidates.append(f"Phones/any(p: p/Number eq '{ph['e164']}')")
+    if ph["last10"]: candidates.append(f"Phones/any(p: p/Number eq '{ph['last10']}')")
 
     async with _client() as client:
         for base in BASES:
             for coll in _ODATA_CONTACT_COLLECTIONS:
                 for filt in candidates:
-                    params = {"$filter": filt, "$top": "1"}
-                    found = await _odata_first(client, base, coll, token, params)
+                    found = await _odata_first(client, base, coll, token, {"$filter": filt, "$top": "1"})
                     if isinstance(found, dict) and "error" in found:
                         continue
                     if found:
@@ -267,8 +249,8 @@ async def get_or_create_contact_by_phone(
         "created": bool,
         "contact": <raw>,
         "contactKey": "guid-or-none",
-        "entity": "contact" | "lead" | "unknown",
-        "link_preference": ["contactKey","leadKey",...]
+        "entity": "contact",
+        "link_preference": ["contactKey","leadKey","partyKey","linkedTo"]
       }
     """
     existing = await find_contact_by_phone(token, raw_phone)
@@ -283,7 +265,6 @@ async def get_or_create_contact_by_phone(
                 "link_preference": ["contactKey","leadKey","partyKey","linkedTo"],
             }
 
-    # create minimal Contact if nothing found
     ph = _phone_formats(raw_phone)
     number = ph["e164"] or ph["last10"]
     if not number:
@@ -316,20 +297,12 @@ async def get_or_create_contact_by_phone(
 # ========= Post History with dynamic link-field probing =========
 
 def _link_field_order_from_env() -> List[str]:
-    """
-    Default order when no explicit preference is provided.
-    Override with:
-      RN_HISTORY_CONTACT_LINK_FIELDS="leadKey,partyKey,contactKey,linkedTo"
-    or:
-      RN_HISTORY_CONTACT_LINK_FIELD="leadKey"
-    """
     multi = os.getenv("RN_HISTORY_CONTACT_LINK_FIELDS")
     if multi:
         return [f.strip() for f in multi.split(",") if f.strip()]
     single = os.getenv("RN_HISTORY_CONTACT_LINK_FIELD")
     if single:
         return [single.strip()]
-    # Tenant-agnostic default
     return ["contactKey", "leadKey", "partyKey", "linkedTo"]
 
 def _merge_order(pref: Optional[List[str]], env_order: List[str]) -> List[str]:
@@ -393,7 +366,7 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
                     out["checks"].append({"url": url, "error": str(e)})
     return out
 
-# ========= JWT helpers + dynamic user/team resolver =========
+# ========= JWT helpers + dynamic user/team/timezone resolver =========
 
 def _b64url_pad(s: str) -> str:
     return s + "=" * ((4 - len(s) % 4) % 4)
@@ -412,10 +385,15 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
     payload = parse_jwt_noverify(token)
     email = payload.get("email") or payload.get("sub") or None
     jwt_user_key = payload.get("user_key") or payload.get("userKey") or None
+    jwt_tz = payload.get("tz") or payload.get("timezone") or payload.get("timeZone") or None
 
-    result: Dict[str, Any] = {"email": email, "user_key": jwt_user_key, "team_key": None, "sources": []}
-    if jwt_user_key:
-        result["sources"].append("jwt")
+    result: Dict[str, Any] = {
+        "email": email,
+        "user_key": jwt_user_key,
+        "team_key": None,
+        "tz": jwt_tz,
+        "sources": ["jwt"] if jwt_user_key or jwt_tz else []
+    }
 
     def _pluck_any(d: Dict[str,Any], names: List[str]) -> Optional[str]:
         for n in names:
@@ -434,7 +412,13 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                             result["user_key"] = uk
                             if "jwt" not in result["sources"]:
                                 result["sources"].append("odata_user")
-                        # try to infer team from user payload
+                        # infer timezone if provided on user
+                        if not result.get("tz"):
+                            tz = _pluck_any(u, _TZ_FIELDS)
+                            if tz:
+                                result["tz"] = tz
+                                result["sources"].append("user_tz_field")
+                        # infer team from user payload
                         for f in list(u.keys()):
                             if f.lower().endswith("teamkey") and u.get(f):
                                 result["team_key"] = str(u[f])
@@ -460,5 +444,4 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                 if result["team_key"]:
                     break
 
-    # final CRM fallbacks omitted here for brevity in this file
     return result
