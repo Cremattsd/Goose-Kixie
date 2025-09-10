@@ -3,3 +3,15 @@ uvicorn[standard]==0.30.0
 python-dotenv==1.0.1
 httpx==0.27.0
 pydantic==2.7.4
+
+# DB & ORM
+SQLAlchemy==2.0.31
+
+# Migrations
+alembic==1.13.1
+
+# Crypto (Fernet/MultiFernet)
+cryptography==42.0.7
+
+# Optional: Postgres driver (skip for SQLite)
+psycopg[binary]==3.1.19
