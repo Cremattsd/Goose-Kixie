@@ -3,16 +3,17 @@ from dotenv import load_dotenv; load_dotenv()
 
 import os
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.routing import APIRoute
+from fastapi.responses import JSONResponse
 
 # Routers
 from .routes.dialer import router as dialer_router
 try:
     from .routes.debug_realnex import router as debug_router
-except Exception:  # optional in case the debug route isn't present
+except Exception:
     from fastapi import APIRouter
     debug_router = APIRouter()
 
@@ -41,14 +42,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Trusted hosts (fixes your syntax error; keep the full argument name)
+# Trusted hosts (tighten in prod)
 trusted_hosts = [h.strip() for h in os.getenv("TRUSTED_HOSTS", "*").split(",")]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
 # ── Root + health ───────────────────────────────────────────────────────────
 @app.get("/", tags=["debug"])
 def root():
-    """Dynamic route index so it never goes stale."""
     routes = []
     for r in app.routes:
         if isinstance(r, APIRoute):
@@ -61,11 +61,24 @@ def root():
 def health():
     return {"ok": True}
 
+# ── Global JSON error handler (prevents Codespaces 502 with empty body) ─────
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": 500,
+            "error": str(exc),
+            "path": request.url.path,
+        },
+    )
+
 # ── Wire routers ────────────────────────────────────────────────────────────
 app.include_router(dialer_router, tags=["dialer"])
 app.include_router(debug_router, tags=["debug"])
 
-# ── Startup sanity logs ─────────────────────────────────────────────────────
+# ── Startup logs ────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup_log():
     rn_token_present = bool(os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN"))
