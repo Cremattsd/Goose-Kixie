@@ -25,9 +25,6 @@ def _bases_from_env() -> List[str]:
 
 BASES = _bases_from_env()
 
-# Which field links History to a contact? (tenant-dependent)
-RN_HISTORY_CONTACT_LINK_FIELD = os.getenv("RN_HISTORY_CONTACT_LINK_FIELD", "contactKey")
-
 # ========= HTTP helpers =========
 
 def _headers(token: str) -> Dict[str,str]:
@@ -293,14 +290,58 @@ async def get_or_create_contact_by_phone(
 
     return {"created": True, "contact": created, "contactKey": key}
 
+# ========= Post History with dynamic link-field probing =========
+
+def _link_field_order_from_env() -> List[str]:
+    """
+    Order of fields to try when linking a History to a contact/lead.
+    You can override with:
+      RN_HISTORY_CONTACT_LINK_FIELDS="leadKey,partyKey,contactKey,linkedTo"
+    or the single:
+      RN_HISTORY_CONTACT_LINK_FIELD="leadKey"
+    """
+    multi = os.getenv("RN_HISTORY_CONTACT_LINK_FIELDS")
+    if multi:
+        return [f.strip() for f in multi.split(",") if f.strip()]
+    single = os.getenv("RN_HISTORY_CONTACT_LINK_FIELD")
+    if single:
+        return [single.strip()]
+    # Default order (tenant-agnostic, but biased for your setup):
+    # - leadKey (your UI shows field as history_info.lead_key / "Linked to")
+    # - partyKey / contactKey common in other tenants
+    # - linkedTo variants seen occasionally
+    return ["leadKey", "LeadKey", "lead_key", "history_info.lead_key",
+            "partyKey", "PartyKey", "contactKey", "ContactKey",
+            "linkedTo", "LinkedTo"]
+
 async def post_history_for_contact(
     token: str,
     contact_key: str,
     history_payload: Dict[str,Any]
 ) -> Any:
-    body = dict(history_payload)
-    body[RN_HISTORY_CONTACT_LINK_FIELD] = contact_key
-    return await create_history(token, body)
+    fields = _link_field_order_from_env()
+    attempts: List[Dict[str,Any]] = []
+
+    for f in fields:
+        body = dict(history_payload)
+        body[f] = contact_key
+        resp = await create_history(token, body)
+        status = resp.get("status", 500) if isinstance(resp, dict) else 500
+        attempts.append({"field": f, "status": status})
+        if status < 400:
+            if isinstance(resp, dict):
+                resp["link_field"] = f
+                resp["attempts"] = attempts
+            return resp
+
+    # If none worked, return the last response and the attempts list
+    last = attempts[-1] if attempts else {"field": None, "status": 500}
+    return {
+        "status": last["status"],
+        "error": "Failed to post History with any link field",
+        "link_field": None,
+        "attempts": attempts,
+    }
 
 # ========= Capability probe =========
 
