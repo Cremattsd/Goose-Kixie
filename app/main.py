@@ -1,4 +1,3 @@
-# app/main.py
 from dotenv import load_dotenv; load_dotenv()
 
 import os
@@ -9,7 +8,6 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse
 
-# Routers
 from .routes.dialer import router as dialer_router
 try:
     from .routes.debug_realnex import router as debug_router
@@ -17,7 +15,6 @@ except Exception:
     from fastapi import APIRouter
     debug_router = APIRouter()
 
-# ── App setup ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("goose-kixie")
 
@@ -32,7 +29,6 @@ app = FastAPI(
     openapi_tags=TAGS,
 )
 
-# CORS (dev-friendly; tighten in prod)
 allow_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 app.add_middleware(
     CORSMiddleware,
@@ -42,11 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Trusted hosts (tighten in prod)
 trusted_hosts = [h.strip() for h in os.getenv("TRUSTED_HOSTS", "*").split(",")]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
-# ── Root + health ───────────────────────────────────────────────────────────
 @app.get("/", tags=["debug"])
 def root():
     routes = []
@@ -61,7 +55,6 @@ def root():
 def health():
     return {"ok": True}
 
-# ── Global JSON error handler (prevents Codespaces 502 with empty body) ─────
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
     logger.exception("Unhandled error on %s", request.url.path)
@@ -74,11 +67,9 @@ async def unhandled_exception(request: Request, exc: Exception):
         },
     )
 
-# ── Wire routers ────────────────────────────────────────────────────────────
 app.include_router(dialer_router, tags=["dialer"])
 app.include_router(debug_router, tags=["debug"])
 
-# ── Startup logs ────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup_log():
     rn_token_present = bool(os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN"))

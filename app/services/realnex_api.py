@@ -1,4 +1,3 @@
-# app/services/realnex_api.py
 import os, httpx, re, asyncio, base64, json
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -138,7 +137,6 @@ _ODATA_CONTACT_COLLECTIONS = [
     "CrmOData/Contacts", "crmodata/Contacts",
     "OData/Contacts", "odata/Contacts",
 ]
-
 _ODATA_USER_COLLECTIONS = [
     "CrmOData/Users", "CrmOData/users", "crmodata/Users", "crmodata/users",
     "OData/Users", "odata/Users",
@@ -156,20 +154,17 @@ async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: s
     url = _join_base_path(base, path)
     try:
         r = await _send(client, "GET", url, token, params=params)
-        # Treat any 4xx/5xx as "no result" (avoid bubbling error dicts)
         if r.status_code >= 400:
             return None
         data = await _format_resp(r)
         if isinstance(data, dict) and isinstance(data.get("value"), list) and data["value"]:
             return data["value"][0]
-        # Some tenants return a single object
         if isinstance(data, dict):
             if "error" in data:
                 return None
             body_keys = {"status","url","method"}
             d = {k:v for k,v in data.items() if k not in body_keys}
             return d or None
-        # Some return bare lists
         if isinstance(data, list) and data:
             return data[0]
         return None
@@ -223,7 +218,7 @@ async def list_teams(token: str) -> List[Dict[str, Any]]:
 async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str,Any]]:
     ph = _phone_formats(raw_phone)
 
-    # 1) Tenant-specific search endpoints first (most reliable)
+    # 1) Tenant search first
     if ph["e164"]:
         rest1 = await search_by_phone(token, ph["e164"])
         items = _as_list_from_search_result(rest1)
@@ -235,7 +230,7 @@ async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str
         if items:
             return items[0]
 
-    # 2) OData Contacts — try SIMPLE fields one-by-one (no Phones/any)
+    # 2) OData simple fields, no Phones/any unless last resort
     simple_fields = [
         "Phone", "MobilePhone", "PrimaryPhone", "PrimaryPhoneNumber",
         "BusinessPhone", "WorkPhone", "HomePhone"
@@ -245,9 +240,8 @@ async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str
         candidates += [f"{f} eq '{ph['e164']}'" for f in simple_fields]
     if ph["last10"]:
         candidates += [f"{f} eq '{ph['last10']}'" for f in simple_fields]
-    # Try Phones/any last, only if others fail (some tenants support it)
     if ph["e164"]:
-        candidates.append(f"Phones/any(p: p/Number eq '{ph['e164']}')")  # may 400 on some tenants
+        candidates.append(f"Phones/any(p: p/Number eq '{ph['e164']}')")
     if ph["last10"]:
         candidates.append(f"Phones/any(p: p/Number eq '{ph['last10']}')")
 
@@ -258,11 +252,9 @@ async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str
                     params = {"$filter": filt, "$top": "1"}
                     found = await _odata_first(client, base, coll, token, params)
                     if isinstance(found, dict) and "error" in found:
-                        # treat as miss, continue trying
                         continue
                     if found:
                         return found
-
     return None
 
 async def get_or_create_contact_by_phone(
@@ -273,7 +265,6 @@ async def get_or_create_contact_by_phone(
     last_name: str = "Unknown"
 ) -> Dict[str,Any]:
     existing = await find_contact_by_phone(token, raw_phone)
-    # Only accept as found if we can extract a real key
     if isinstance(existing, dict):
         key = extract_contact_key(existing)
         if key:
@@ -294,7 +285,6 @@ async def get_or_create_contact_by_phone(
         payload["TeamKey"] = team_key
 
     created = await create_contact(token, payload)
-    # created may be dict with id fields at top-level or nested
     key = None
     if isinstance(created, dict):
         key = extract_contact_key(created)
@@ -411,7 +401,6 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                 if result["team_key"]:
                     break
 
-    # Fallback to CRM lists if still no team
     if result["user_key"] and not result["team_key"]:
         users = await list_users(token)
         teams = await list_teams(token)
