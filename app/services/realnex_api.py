@@ -41,7 +41,11 @@ def _headers(token: str) -> Dict[str,str]:
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
 
-async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
+async def _format_resp(resp: httpx.Response) -> Any:
+    """
+    Return JSON (dict OR list). If JSON is not parseable, return a tiny dict.
+    For dict payloads, we also attach status/url/method keys.
+    """
     try:
         data = resp.json() if resp.content else {}
     except Exception:
@@ -61,10 +65,11 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **
     req = client.build_request(method, url, headers=_headers(token), **kw)
     return await client.send(req)
 
-async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[str,Any]:
+async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Any:
     """
     Try the given relative paths across all discovered BASES until one returns non-404.
     Return the formatted response of the first non-404, otherwise the last one.
+    Can return dict OR list depending on the endpoint.
     """
     async with _client() as client:
         last = None
@@ -118,7 +123,7 @@ def _phone_formats(raw: Optional[str]) -> Dict[str, Optional[str]]:
 
 # ========= Core endpoints (generic wrappers) =========
 
-async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
+async def search_by_phone(token: str, phone_e164: str) -> Any:
     return await _try_paths(
         "GET",
         ["Contacts/search","Contact/search","contacts/search","contact/search"],
@@ -126,7 +131,7 @@ async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
         params={"phone": phone_e164}
     )
 
-async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+async def create_contact(token: str, payload: Dict[str, Any]) -> Any:
     return await _try_paths(
         "POST",
         ["contact","Contact","contacts","Contacts"],
@@ -134,7 +139,7 @@ async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
         json=payload
     )
 
-async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+async def create_history(token: str, payload: Dict[str, Any]) -> Any:
     return await _try_paths(
         "POST",
         ["history","History","histories","Histories"],
@@ -169,11 +174,13 @@ async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: s
         if r.status_code == 404:
             return None
         data = await _format_resp(r)
-        if isinstance(data.get("value"), list) and data["value"]:
+        if isinstance(data, dict) and isinstance(data.get("value"), list) and data["value"]:
             return data["value"][0]
-        body_keys = {"status","url","method"}
-        d = {k:v for k,v in data.items() if k not in body_keys}
-        return d or None
+        if isinstance(data, dict):
+            body_keys = {"status","url","method"}
+            d = {k:v for k,v in data.items() if k not in body_keys}
+            return d or None
+        return None
     except httpx.HTTPError:
         return None
 
@@ -183,7 +190,9 @@ def _odata_filter(email: str) -> Dict[str,str]:
 
 # ========= Parsing helpers =========
 
-def _as_list_from_search_result(resp: Dict[str,Any]) -> List[Dict[str,Any]]:
+def _as_list_from_search_result(resp: Any) -> List[Dict[str,Any]]:
+    if isinstance(resp, list):
+        return resp
     if not isinstance(resp, dict):
         return []
     if isinstance(resp.get("items"), list):
@@ -206,6 +215,16 @@ def _pluck_any(d: Dict[str,Any], names: List[str]) -> Optional[str]:
         if n in d and d[n]:
             return str(d[n])
     return None
+
+# ========= Non-OData fallbacks (CRM endpoints) =========
+
+async def list_users(token: str) -> List[Dict[str, Any]]:
+    resp = await _try_paths("GET", ["Users","users","CRM/Users","CRM/users"], token)
+    return resp if isinstance(resp, list) else _as_list_from_search_result(resp)
+
+async def list_teams(token: str) -> List[Dict[str, Any]]:
+    resp = await _try_paths("GET", ["Teams","teams","CRM/Teams","CRM/teams"], token)
+    return resp if isinstance(resp, list) else _as_list_from_search_result(resp)
 
 # ========= High-level helpers =========
 
@@ -276,14 +295,14 @@ async def get_or_create_contact_by_phone(
         payload["TeamKey"] = team_key
     payload["Phones"] = [{"Number": number, "Type": "Mobile"}]
     created = await create_contact(token, payload)
-    key = extract_contact_key(created)
+    key = extract_contact_key(created if isinstance(created, dict) else {})
     return {"created": True, "contact": created, "contactKey": key}
 
 async def post_history_for_contact(
     token: str,
     contact_key: str,
     history_payload: Dict[str,Any]
-) -> Dict[str,Any]:
+) -> Any:
     body = dict(history_payload)
     body[RN_HISTORY_CONTACT_LINK_FIELD] = contact_key
     return await create_history(token, body)
@@ -331,7 +350,9 @@ def parse_jwt_noverify(jwt: str) -> Dict[str, Any]:
 
 async def resolve_rn_context(token: str) -> Dict[str, Any]:
     """
-    Resolve user/team from JWT claims + OData.
+    Resolve user/team from JWT claims + OData. If OData is unavailable,
+    fall back to CRM /Users and /Teams, preferring the user's Private team
+    (often teamKey == userKey in RealNex).
     """
     payload = parse_jwt_noverify(token)
     email = payload.get("email") or payload.get("sub") or None
@@ -363,8 +384,8 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                             return str(first[k])
         return None
 
+    # --- Primary path: OData (if available) ---
     async with _client() as client:
-        # 1) Find user by email to confirm user_key and maybe team
         if email:
             for base in BASES:
                 for coll in _ODATA_USER_COLLECTIONS:
@@ -379,9 +400,8 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                         if tk:
                             result["team_key"] = tk
                             result["sources"].append("user_team_field")
-                        break  # got a user; stop scanning bases/collections
+                        break
 
-        # 2) If still no team, try Teams membership (Users/Members nav)
         if result["user_key"] and not result["team_key"]:
             uk = result["user_key"]
             membership_filters = [
@@ -402,6 +422,46 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                     if result["team_key"]:
                         break
                 if result["team_key"]:
+                    break
+
+    # --- Fallback path: CRM lists (no OData on tenant) ---
+    if result["user_key"] and not result["team_key"]:
+        # Fetch lists
+        users = await list_users(token)   # [{'key','userId','userName','loginName','active'}, ...]
+        teams = await list_teams(token)   # [{'key','name'}, ...]
+        uk = result["user_key"]
+
+        # Find matching user record (optional; for display name)
+        uname = None
+        for u in users:
+            if str(u.get("key")) == uk:
+                uname = u.get("userName") or u.get("loginName") or None
+                break
+
+        # Prefer team whose key equals user key (common "Private (Name)" mapping)
+        for t in teams:
+            if str(t.get("key")) == uk:
+                result["team_key"] = uk
+                result["sources"].append("crm_teams_key_equals_userkey")
+                break
+
+        # Else look for "Private (UserName)"
+        if not result["team_key"] and uname:
+            private_name = f"Private ({uname})"
+            for t in teams:
+                if t.get("name") == private_name:
+                    result["team_key"] = str(t.get("key"))
+                    result["sources"].append("crm_teams_private_name")
+                    break
+
+        # Else fuzzy contains user's name
+        if not result["team_key"] and uname:
+            low = uname.lower()
+            for t in teams:
+                n = (t.get("name") or "").lower()
+                if low in n:
+                    result["team_key"] = str(t.get("key"))
+                    result["sources"].append("crm_teams_name_contains_user")
                     break
 
     return result
