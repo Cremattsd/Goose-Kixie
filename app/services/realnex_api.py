@@ -1,4 +1,4 @@
-# services/realnex_api.py
+# app/services/realnex_api.py
 import os, httpx, re, asyncio, base64, json
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -80,6 +80,23 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
                     return {"status": 599, "error": str(e), "attempted": url}
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
+# ========= URL join helper for OData =========
+
+def _join_base_path(base: str, path: str) -> str:
+    """
+    Join base and relative path but avoid duplicate segments like:
+      base=.../CrmOData  path=CrmOData/Users  -> .../CrmOData/Users
+    """
+    base = base.rstrip("/")
+    path = path.lstrip("/")
+    if not path:
+        return base
+    btail = base.rsplit("/", 1)[-1].lower()
+    phead = path.split("/", 1)[0].lower()
+    if btail == phead:
+        path = path.split("/", 1)[1] if "/" in path else ""
+    return f"{base}/{path}" if path else base
+
 # ========= Phone utils =========
 
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
@@ -146,7 +163,7 @@ _TEAM_KEY_FIELDS = ["TeamKey","teamKey","Key","Id","id"]
 _EMAIL_FIELDS = ["Email","email","UserEmail","Username","username","Login","login"]
 
 async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]):
-    url = f"{base}/{path}"
+    url = _join_base_path(base, path)
     try:
         r = await _send(client, "GET", url, token, params=params)
         if r.status_code == 404:
@@ -217,17 +234,20 @@ async def find_contact_by_phone(token: str, raw_phone: str) -> Optional[Dict[str
                 return items[0]
         for base in BASES:
             for coll in _ODATA_CONTACT_COLLECTIONS:
-                params = {
-                    "$filter": " or ".join([
-                        *( [f"Phones/any(p: p/Number eq '{ph['e164']}')"] if ph["e164"] else [] ),
-                        *( [f"Phones/any(p: p/Number eq '{ph['last10']}')"] if ph["last10"] else [] ),
-                        *( [f"MobilePhone eq '{ph['e164']}'"] if ph["e164"] else [] ),
-                        *( [f"MobilePhone eq '{ph['last10']}'"] if ph["last10"] else [] ),
-                        *( [f"Phone eq '{ph['e164']}'"] if ph["e164"] else [] ),
-                        *( [f"Phone eq '{ph['last10']}'"] if ph["last10"] else [] ),
-                    ]),
-                    "$top": "1"
-                }
+                conds = []
+                if ph["e164"]:
+                    conds += [
+                        f"Phones/any(p: p/Number eq '{ph['e164']}')",
+                        f"MobilePhone eq '{ph['e164']}'",
+                        f"Phone eq '{ph['e164']}'",
+                    ]
+                if ph["last10"]:
+                    conds += [
+                        f"Phones/any(p: p/Number eq '{ph['last10']}')",
+                        f"MobilePhone eq '{ph['last10']}'",
+                        f"Phone eq '{ph['last10']}'",
+                    ]
+                params = {"$filter": " or ".join(conds), "$top": "1"}
                 found = await _odata_first(client, base, coll, token, params)
                 if found:
                     return found
@@ -290,7 +310,7 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
                     out["checks"].append({"url": url, "error": str(e)})
     return out
 
-# ========= NEW: Resolve RN user/team from JWT + OData =========
+# ========= JWT helpers + dynamic user/team resolver =========
 
 def _b64url_pad(s: str) -> str:
     return s + "=" * ((4 - len(s) % 4) % 4)
@@ -311,12 +331,7 @@ def parse_jwt_noverify(jwt: str) -> Dict[str, Any]:
 
 async def resolve_rn_context(token: str) -> Dict[str, Any]:
     """
-    Returns: {
-      'email': str|None,
-      'user_key': str|None,
-      'team_key': str|None,
-      'sources': ['jwt','odata_user','odata_team', ...]
-    }
+    Resolve user/team from JWT claims + OData.
     """
     payload = parse_jwt_noverify(token)
     email = payload.get("email") or payload.get("sub") or None
@@ -331,8 +346,25 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
     if jwt_user_key:
         result["sources"].append("jwt")
 
-    # If we have email, fetch user via OData to confirm keys and maybe team
+    # helper: pull any *TeamKey-like field or first team ref from user object
+    def _extract_team_from_user(u: Dict[str, Any]) -> Optional[str]:
+        # direct fields
+        for f in list(u.keys()):
+            if f.lower().endswith("teamkey") and u.get(f):
+                return str(u[f])
+        # nested Teams arrays (various shapes)
+        for f in ("Teams", "teams", "UserTeams", "userTeams"):
+            val = u.get(f)
+            if isinstance(val, list) and val:
+                first = val[0]
+                if isinstance(first, dict):
+                    for k in ("TeamKey","teamKey","Key","key","Id","id"):
+                        if k in first and first[k]:
+                            return str(first[k])
+        return None
+
     async with _client() as client:
+        # 1) Find user by email to confirm user_key and maybe team
         if email:
             for base in BASES:
                 for coll in _ODATA_USER_COLLECTIONS:
@@ -343,27 +375,32 @@ async def resolve_rn_context(token: str) -> Dict[str, Any]:
                             result["user_key"] = uk
                             if "jwt" not in result["sources"]:
                                 result["sources"].append("odata_user")
-                        # Try common team fields on the user object
-                        for f in ("DefaultTeamKey","TeamKey","PrimaryTeamKey","teamKey","defaultTeamKey"):
-                            if f in u and u[f]:
-                                result["team_key"] = str(u[f])
-                                result["sources"].append("user_team_field")
-                                break
-                        break
-
-        # If still no team, try Teams membership via OData
-        if result["user_key"] and not result["team_key"]:
-            uk = result["user_key"]
-            for base in BASES:
-                for coll in _ODATA_TEAM_COLLECTIONS:
-                    params = {"$filter": f"Users/any(u: u/Key eq '{uk}')", "$top": "1"}
-                    t = await _odata_first(client, base, coll, token, params)
-                    if t:
-                        tk = _pluck_any(t, _TEAM_KEY_FIELDS)
+                        tk = _extract_team_from_user(u)
                         if tk:
                             result["team_key"] = tk
-                            result["sources"].append("odata_team")
-                            break
+                            result["sources"].append("user_team_field")
+                        break  # got a user; stop scanning bases/collections
+
+        # 2) If still no team, try Teams membership (Users/Members nav)
+        if result["user_key"] and not result["team_key"]:
+            uk = result["user_key"]
+            membership_filters = [
+                f"Users/any(u: u/Key eq '{uk}')",     # common
+                f"Members/any(u: u/Key eq '{uk}')"     # some tenants
+            ]
+            for base in BASES:
+                for coll in _ODATA_TEAM_COLLECTIONS:
+                    for mf in membership_filters:
+                        params = {"$filter": mf, "$top": "1"}
+                        t = await _odata_first(client, base, coll, token, params)
+                        if t:
+                            tk = _pluck_any(t, _TEAM_KEY_FIELDS)
+                            if tk:
+                                result["team_key"] = tk
+                                result["sources"].append("odata_team_membership")
+                                break
+                    if result["team_key"]:
+                        break
                 if result["team_key"]:
                     break
 

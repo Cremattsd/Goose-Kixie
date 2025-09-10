@@ -14,6 +14,17 @@ def _headers(token: str) -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+def _join_base_path(base: str, path: str) -> str:
+    base = base.rstrip("/")
+    path = path.lstrip("/")
+    if not path:
+        return base
+    btail = base.rsplit("/", 1)[-1].lower()
+    phead = path.split("/", 1)[0].lower()
+    if btail == phead:
+        path = path.split("/", 1)[1] if "/" in path else ""
+    return f"{base}/{path}" if path else base
+
 @router.get("/debug/realnex/env")
 async def debug_env():
     """Safe env flags (no secrets)."""
@@ -33,8 +44,8 @@ async def debug_probe():
 
 @router.get("/debug/realnex/paths")
 async def debug_try_paths(
-    paths: List[str] = Query(..., description="Relative paths to try, e.g. contact, history, CrmOData/Contacts"),
-    method: str = Query("OPTIONS", description="HTTP method to use (OPTIONS|GET)"),
+    paths: List[str] = Query(..., description="Relative paths to try. Example: 'Users?$top=1' or 'CrmOData/Users?$top=1'"),
+    method: str = Query("GET", description="HTTP method to use (GET|OPTIONS)"),
 ):
     """Try arbitrary relative paths across all bases. Helpful for odd tenant shapes."""
     token = get_rn_token()
@@ -43,20 +54,19 @@ async def debug_try_paths(
 
     method = method.upper()
     if method not in {"OPTIONS", "GET"}:
-        method = "OPTIONS"
+        method = "GET"
 
     out: Dict[str, Any] = {"bases": BASES, "method": method, "paths": paths, "attempts": []}
     async with httpx.AsyncClient(timeout=20) as client:
         for base in BASES:
             for p in paths:
-                url = f"{base.rstrip('/')}/{p.lstrip('/')}"
+                url = _join_base_path(base, p)
                 try:
                     r = await client.request(method, url, headers=_headers(token))
-                    body: Any
                     try:
                         body = r.json()
-                        # keep tiny; don’t flood logs
                         if isinstance(body, dict):
+                            # keep response tiny
                             body = {k: body[k] for k in list(body.keys())[:5]}
                     except Exception:
                         body = r.text[:500]
@@ -66,8 +76,5 @@ async def debug_try_paths(
                         "body": body,
                     })
                 except Exception as e:
-                    out["attempts"].append({
-                        "url": url,
-                        "error": str(e),
-                    })
+                    out["attempts"].append({"url": url, "error": str(e)})
     return out
