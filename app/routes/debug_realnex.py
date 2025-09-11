@@ -1,17 +1,20 @@
 # app/routes/debug_realnex.py
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 import os, httpx
 from typing import List, Dict, Any
 
-from ..services.realnex_api import probe_endpoints, get_rn_token, BASES
+from ..services.realnex_api import (
+    probe_endpoints, get_rn_token, BASES,
+    list_timezones, attach_recording_from_url
+)
 
 router = APIRouter()
 
 def _headers(token: str) -> Dict[str, str]:
+    # No Content-Type for GET/OPTIONS.
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        "Content-Type": "application/json",
     }
 
 def _join_base_path(base: str, path: str) -> str:
@@ -44,8 +47,8 @@ async def debug_probe():
 
 @router.get("/debug/realnex/paths")
 async def debug_try_paths(
-    paths: List[str] = Query(..., description="Relative paths to try. Example: 'Users?$top=1' or 'CrmOData/Users?$top=1'"),
-    method: str = Query("GET", description="HTTP method to use (GET|OPTIONS)"),
+    paths: List[str] = Query(..., description="Relative paths, e.g. 'Users?$top=1'"),
+    method: str = Query("GET", description="HTTP method: GET|OPTIONS"),
 ):
     """Try arbitrary relative paths across all bases. Helpful for odd tenant shapes."""
     token = get_rn_token()
@@ -66,15 +69,32 @@ async def debug_try_paths(
                     try:
                         body = r.json()
                         if isinstance(body, dict):
-                            # keep response tiny
                             body = {k: body[k] for k in list(body.keys())[:5]}
                     except Exception:
                         body = r.text[:500]
-                    out["attempts"].append({
-                        "url": url,
-                        "status": r.status_code,
-                        "body": body,
-                    })
+                    out["attempts"].append({"url": url, "status": r.status_code, "body": body})
                 except Exception as e:
                     out["attempts"].append({"url": url, "error": str(e)})
     return out
+
+@router.get("/debug/realnex/timezones")
+async def debug_timezones():
+    """Lists RealNex-supported timezone keys."""
+    token = get_rn_token()
+    if not token:
+        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
+    return await list_timezones(token)
+
+@router.post("/debug/realnex/attachment_test")
+async def debug_attachment_test(
+    objectKey: str = Query(..., description="GUID of existing object (e.g., contactKey)"),
+    url: str = Query(..., description="Publicly fetchable file URL to attach"),
+):
+    """
+    Writes: fetches `url` and POSTs to /attachment/{objectKey}.
+    Use against known objects only. For test/debug.
+    """
+    token = get_rn_token()
+    if not token:
+        raise HTTPException(status_code=500, detail="REALNEX_TOKEN/REALNEX_JWT not set")
+    return await attach_recording_from_url(token, objectKey, url)
