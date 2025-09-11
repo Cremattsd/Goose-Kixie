@@ -23,3 +23,13 @@ __pycache__/
 .env
 .env.*
 *.db
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets & local data
+.env
+.env.*
+*.db
