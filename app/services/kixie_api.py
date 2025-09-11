@@ -1,193 +1,114 @@
-# services/kixie_api.py
-import os
-import asyncio
-from typing import Dict, Any, Optional, Iterable, Tuple, List
+# app/services/kixie_api.py
+import os, httpx
+from typing import Dict, Any, List, Optional
+from .realnex_api import normalize_phone_e164ish
 
-import httpx
+KIXIE_MGMT_BASE = os.getenv("KIXIE_API_BASE", "https://apig.kixie.com/app/v1/api")
+KIXIE_EVENT_BASE = "https://apig.kixie.com/app/event"  # for make-a-call & powerlist
 
-# ---- Config ----
-KIXIE_BASE = os.getenv("KIXIE_API_BASE", "https://apig.kixie.com/app/v1/api").rstrip("/")
-KIXIE_TIMEOUT = float(os.getenv("KIXIE_HTTP_TIMEOUT", "15"))
+def _api_key() -> str:
+    return os.getenv("KIXIE_API_KEY", "")
 
-class KixieAPIError(Exception):
-    """Raised when Kixie returns a non-2xx response with details."""
-    def __init__(self, status: int, url: str, body: Any):
-        super().__init__(f"Kixie API error {status} for {url}: {body!r}")
-        self.status = status
-        self.url = url
-        self.body = body
+def _biz_id() -> str:
+    return os.getenv("KIXIE_BUSINESS_ID", "")
 
-# ---- Low-level HTTP helper (POST-only per Kixie endpoints you’re using) ----
-async def _post(
-    path: str,
-    json: Dict[str, Any],
-    *,
-    client: Optional[httpx.AsyncClient] = None,
-    retries: int = 2,
-    backoff_sec: float = 0.6,
-) -> Dict[str, Any]:
+async def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=payload)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+        data.setdefault("status", r.status_code)
+        data.setdefault("url", str(r.request.url))
+        return data
+
+# ── Existing webhook mgmt helpers (kept) ───────────────────────────────────────
+async def create_or_update_webhook(apikey: str, businessid: str, payload: Dict[str, Any]) -> dict:
+    return await _post_json(f"{KIXIE_MGMT_BASE}/postwebhook",
+                            {"apikey": apikey, "businessid": businessid, **payload})
+
+async def list_webhooks(apikey: str, businessid: str) -> dict:
+    return await _post_json(f"{KIXIE_MGMT_BASE}/getWebhooks",
+                            {"apikey": apikey, "businessid": businessid, "call": "getWebhooks"})
+
+async def delete_webhook(apikey: str, businessid: str, webhookid: str) -> dict:
+    return await _post_json(f"{KIXIE_MGMT_BASE}/deleteWebhooks",
+                            {"apikey": apikey, "businessid": businessid, "call": "removeWebhook", "webhookid": webhookid})
+
+# ── Make-a-call (FYI) ─────────────────────────────────────────────────────────
+async def make_call(email: str, target_e164: str, displayname: Optional[str] = None) -> Dict[str, Any]:
     """
-    POST to Kixie; small retry on 429/5xx; raises KixieAPIError with parsed body when possible.
+    Uses Kixie's 'Make a Call' API (POST to /app/event?apikey=...)
     """
-    owns_client = client is None
-    if owns_client:
-        client = httpx.AsyncClient(timeout=KIXIE_TIMEOUT)
-
-    url = f"{KIXIE_BASE}/{path.lstrip('/')}"
-    last_exc = None
-
-    try:
-        for attempt in range(retries + 1):
-            try:
-                r = await client.post(url, json=json)
-            except httpx.HTTPError as e:
-                last_exc = e
-                if attempt >= retries:
-                    raise
-                await asyncio.sleep(backoff_sec * (attempt + 1))
-                continue
-
-            if 200 <= r.status_code < 300:
-                try:
-                    return r.json()
-                except Exception:
-                    # Fallback if Kixie returns non-JSON success (unlikely)
-                    return {"ok": True, "raw": r.text}
-
-            # Non-2xx: try to surface JSON body
-            try:
-                body = r.json()
-            except Exception:
-                body = r.text
-
-            # Retry on 429/5xx
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                await asyncio.sleep(backoff_sec * (attempt + 1))
-                continue
-
-            raise KixieAPIError(r.status_code, url, body)
-    finally:
-        if owns_client:
-            await client.aclose()
-
-    # Should never hit here
-    raise RuntimeError(f"Unexpected fallthrough for {url}: {last_exc!r}")
-
-# ---- Raw endpoints (preserve your current shapes) ----
-async def create_or_update_webhook(
-    apikey: str,
-    businessid: str,
-    payload: Dict[str, Any],
-    *,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Dict[str, Any]:
-    """
-    Kixie 'postwebhook' – payload pass-through.
-    Example payload typically includes: url, events, secret, method, etc.
-    """
-    body = {"apikey": apikey, "businessid": businessid, **payload}
-    return await _post("postwebhook", body, client=client)
-
-async def list_webhooks(
-    apikey: str,
-    businessid: str,
-    *,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Dict[str, Any]:
-    """
-    Kixie 'getWebhooks' – returns the registered webhooks.
-    """
-    body = {"apikey": apikey, "businessid": businessid, "call": "getWebhooks"}
-    return await _post("getWebhooks", body, client=client)
-
-async def delete_webhook(
-    apikey: str,
-    businessid: str,
-    webhookid: str,
-    *,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Dict[str, Any]:
-    """
-    Kixie 'deleteWebhooks' – remove a webhook by ID.
-    """
-    body = {
+    apikey, biz = _api_key(), _biz_id()
+    payload = {
+        "businessid": biz,
+        "email": email,
+        "target": target_e164,
+        "displayname": displayname or target_e164,
+        "eventname": "call",
         "apikey": apikey,
-        "businessid": businessid,
-        "call": "removeWebhook",
-        "webhookid": webhookid,
     }
-    return await _post("deleteWebhooks", body, client=client)
+    return await _post_json(f"{KIXIE_EVENT_BASE}?apikey={apikey}", payload)
 
-# ---- Helpers: tolerant parsing + idempotent upsert ----
-def _iter_webhooks(obj: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+# ── PowerList helpers (NEW) ───────────────────────────────────────────────────
+async def add_to_powerlist_one(powerlist_id: str,
+                               phone_raw: str,
+                               first_name: str | None = None,
+                               last_name: str | None = None,
+                               company: str | None = None,
+                               email: str | None = None,
+                               extra_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Tolerantly yield webhook dicts from various common response shapes:
-      {"webhooks":[...]}, {"items":[...]}, {"data":[...]}, or a single dict.
+    Add ONE number to a PowerList (Kixie API only supports one-at-a-time).
+    Docs: https://support.kixie.com/hc/en-us/articles/19135310564635-Powerlist-API
     """
-    if not isinstance(obj, dict):
-        return []
-    for key in ("webhooks", "items", "data"):
-        if isinstance(obj.get(key), list):
-            return obj[key]
-    # Some Kixie responses might return directly a list
-    if isinstance(obj.get("result"), list):
-        return obj["result"]
-    # Single object fallback
-    if any(k in obj for k in ("id", "webhookid", "url")):
-        return [obj]
-    return []
+    apikey, biz = _api_key(), _biz_id()
+    target = normalize_phone_e164ish(phone_raw) or phone_raw
+    payload = {
+        "businessid": biz,
+        "powerlistId": powerlist_id,
+        "apikey": apikey,
+        "target": target,
+        "eventname": "updatepowerlist",
+        "firstName": first_name or "",
+        "lastName": last_name or "",
+        "companyName": company or "",
+        "email": email or "",
+    }
+    if extra_data:
+        payload["extraData"] = extra_data
+    return await _post_json(f"{KIXIE_EVENT_BASE}?apikey={apikey}", payload)
 
-def _matches(
-    existing: Dict[str, Any],
-    desired: Dict[str, Any],
-    match_on: Tuple[str, ...],
-) -> bool:
+async def add_many_to_powerlist(powerlist_id: str, contacts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Compare selected keys (case-insensitive for strings).
+    contacts: [{phone, first_name?, last_name?, company?, email?, extra_data?}, ...]
     """
-    for k in match_on:
-        ev = existing.get(k)
-        dv = desired.get(k)
-        if isinstance(ev, str) and isinstance(dv, str):
-            if ev.strip().lower() != dv.strip().lower():
-                return False
-        else:
-            if ev != dv:
-                return False
-    return True
-
-async def ensure_webhook(
-    apikey: str,
-    businessid: str,
-    desired: Dict[str, Any],
-    *,
-    match_on: Tuple[str, ...] = ("url", "method"),
-    client: Optional[httpx.AsyncClient] = None,
-) -> Dict[str, Any]:
-    """
-    Idempotently ensure a webhook with matching fields exists.
-    - Lists current webhooks
-    - If a match is found on `match_on`, returns it (and updates if you pass extra fields)
-    - Else creates via create_or_update_webhook
-    """
-    owns_client = client is None
-    if owns_client:
-        client = httpx.AsyncClient(timeout=KIXIE_TIMEOUT)
-
-    try:
-        current = await list_webhooks(apikey, businessid, client=client)
-        for w in _iter_webhooks(current):
-            if _matches(w, desired, match_on):
-                # Optional: push an update if you want to enforce new fields (e.g., events/secret)
-                maybe_update = {**desired, "webhookid": w.get("webhookid") or w.get("id")}
-                return {
-                    "action": "exists",
-                    "webhook": w,
-                    "maybe_update": await create_or_update_webhook(apikey, businessid, maybe_update, client=client)
-                }
-        # No match → create
-        created = await create_or_update_webhook(apikey, businessid, desired, client=client)
-        return {"action": "created", "webhook": created}
-    finally:
-        if owns_client:
-            await client.aclose()
+    out = {"powerlistId": powerlist_id, "ok": 0, "skipped": 0, "fail": 0, "results": []}
+    seen: set[str] = set()
+    for c in contacts:
+        raw = c.get("phone") or c.get("target") or ""
+        norm = normalize_phone_e164ish(raw) or raw
+        if not norm:
+            out["skipped"] += 1
+            out["results"].append({"phone": raw, "status": "skipped_no_phone"})
+            continue
+        if norm in seen:
+            out["skipped"] += 1
+            out["results"].append({"phone": norm, "status": "skipped_duplicate"})
+            continue
+        seen.add(norm)
+        resp = await add_to_powerlist_one(
+            powerlist_id=powerlist_id,
+            phone_raw=norm,
+            first_name=c.get("first_name"),
+            last_name=c.get("last_name"),
+            company=c.get("company"),
+            email=c.get("email"),
+            extra_data=c.get("extra_data"),
+        )
+        ok = 200 <= resp.get("status", 0) < 300
+        out["ok" if ok else "fail"] += 1
+        out["results"].append({"phone": norm, "resp": resp, "ok": ok})
+    return out
