@@ -1,4 +1,3 @@
-# app/routes/debug_realnex.py
 from fastapi import APIRouter, Query, HTTPException
 import os, httpx
 from typing import List, Dict, Any
@@ -6,7 +5,8 @@ from typing import List, Dict, Any
 from ..services.realnex_api import (
     probe_endpoints, get_rn_token, BASES,
     list_timezones, attach_recording_from_url,
-    search_by_phone, search_contact_by_phone_wide
+    search_by_phone, search_contact_by_phone_wide,
+    get_contact, get_contact_full,
 )
 
 router = APIRouter()
@@ -90,13 +90,25 @@ async def debug_attachment_test(
 
 @router.get("/debug/realnex/search_phone")
 async def debug_search_phone(phone: str = Query(..., description="Phone to search")):
-    """
-    Shows both: standard Contacts/search AND the OData wide fallback.
-    Useful to see which one your tenant supports for this record.
-    """
     token = get_rn_token()
     if not token:
         return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
     std = await search_by_phone(token, phone)
     wide = await search_contact_by_phone_wide(token, phone)
     return {"standard": std, "wide": wide}
+
+# >>> NEW: get contact by key (basic)
+@router.get("/debug/realnex/contact")
+async def debug_contact(contactKey: str = Query(..., description="Contact GUID")):
+    token = get_rn_token()
+    if not token:
+        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
+    return await get_contact(token, contactKey)
+
+# >>> NEW: get contact by key (full)
+@router.get("/debug/realnex/contact_full")
+async def debug_contact_full(contactKey: str = Query(..., description="Contact GUID")):
+    token = get_rn_token()
+    if not token:
+        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
+    return await get_contact_full(token, contactKey)

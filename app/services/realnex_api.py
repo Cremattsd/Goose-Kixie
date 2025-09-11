@@ -1,6 +1,5 @@
-# app/services/realnex_api.py
 import os, httpx, re, asyncio
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 from urllib.parse import urlparse, unquote
 
 def get_rn_token() -> str:
@@ -63,7 +62,6 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
 # ---------- Phone utils ----------
-
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     if not raw: return None
     digits = re.sub(r"\D+", "", raw)
@@ -79,13 +77,11 @@ def digits_only(raw: Optional[str]) -> Optional[str]:
     return d or None
 
 # ---------- Contacts & History ----------
-
 async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
     return await _try_paths("GET",
         ["Contacts/search","Contact/search","contacts/search","contact/search"],
         token, params={"phone": phone_e164})
 
-# NEW: wide search via OData contains() across common phone fields
 _ODATA_CONTACT_PATHS = [
     "CrmOData/Contacts","crmodata/Contacts","OData/Contacts","odata/Contacts"
 ]
@@ -96,15 +92,9 @@ _PHONE_FIELDS = [
 ]
 
 async def search_contact_by_phone_wide(token: str, phone_raw: str) -> Dict[str, Any]:
-    """
-    Fallback: if Contacts/search misses, probe OData Contacts with contains()
-    on many phone fields using digits-only token (robust to formatting).
-    Returns the raw response of the first non-404 hit; may include .value list.
-    """
     d = digits_only(phone_raw)
     if not d:
         return {"status": 400, "error": "no_digits"}
-    # Build $filter like: contains(PrimaryPhone,'8584581063') or contains(MobilePhone,'8584581063') ...
     flt = " or ".join([f"contains({f},'{d}')" for f in _PHONE_FIELDS])
     params = {"$filter": flt, "$top": "1"}
     return await _try_paths("GET", _ODATA_CONTACT_PATHS, token, params=params)
@@ -119,8 +109,24 @@ async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
         ["history","History","histories","Histories"],
         token, json=payload)
 
-# ---------- Timezones ----------
+# >>> NEW: get contact (basic) and full variants <<<
+async def get_contact(token: str, contact_key: str) -> Dict[str, Any]:
+    k = contact_key
+    paths = [
+        f"contact/{k}", f"Contact/{k}", f"contacts/{k}", f"Contacts/{k}",
+        f"CRM/contact/{k}", f"CRM/Contact/{k}",
+    ]
+    return await _try_paths("GET", paths, token)
 
+async def get_contact_full(token: str, contact_key: str) -> Dict[str, Any]:
+    k = contact_key
+    paths = [
+        f"contact/{k}/full", f"Contact/{k}/full", f"contacts/{k}/full", f"Contacts/{k}/full",
+        f"CRM/contact/{k}/full", f"CRM/Contact/{k}/full",
+    ]
+    return await _try_paths("GET", paths, token)
+
+# ---------- Timezones ----------
 async def list_timezones(token: str) -> Dict[str, Any]:
     return await _try_paths("GET",
         ["timezones","Timezones","CRM/timezones","CRM/Timezones"],
@@ -138,7 +144,6 @@ async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
     return tz in tzs if tzs else True
 
 # ---------- Attachments ----------
-
 def _basename_from_url(u: str) -> str:
     try:
         path = urlparse(u).path
@@ -185,7 +190,6 @@ async def attach_recording_from_url(token: str, object_key: str, recording_url: 
         return {"status": 500, "error": str(e)}
 
 # ---------- Probe ----------
-
 async def probe_endpoints(token: str) -> Dict[str, Any]:
     shapes = [
         "contact","history","users","teams",
