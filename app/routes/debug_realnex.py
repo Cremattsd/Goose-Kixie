@@ -5,17 +5,14 @@ from typing import List, Dict, Any
 
 from ..services.realnex_api import (
     probe_endpoints, get_rn_token, BASES,
-    list_timezones, attach_recording_from_url
+    list_timezones, attach_recording_from_url,
+    search_by_phone, search_contact_by_phone_wide
 )
 
 router = APIRouter()
 
 def _headers(token: str) -> Dict[str, str]:
-    # No Content-Type for GET/OPTIONS.
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 def _join_base_path(base: str, path: str) -> str:
     base = base.rstrip("/")
@@ -30,7 +27,6 @@ def _join_base_path(base: str, path: str) -> str:
 
 @router.get("/debug/realnex/env")
 async def debug_env():
-    """Safe env flags (no secrets)."""
     return {
         "has_token": bool(get_rn_token()),
         "REALNEX_API_BASE": os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm"),
@@ -39,7 +35,6 @@ async def debug_env():
 
 @router.get("/debug/realnex/probe")
 async def debug_probe():
-    """OPTIONS probe of common endpoints across all bases."""
     token = get_rn_token()
     if not token:
         return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
@@ -50,7 +45,6 @@ async def debug_try_paths(
     paths: List[str] = Query(..., description="Relative paths, e.g. 'Users?$top=1'"),
     method: str = Query("GET", description="HTTP method: GET|OPTIONS"),
 ):
-    """Try arbitrary relative paths across all bases. Helpful for odd tenant shapes."""
     token = get_rn_token()
     if not token:
         return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set", "paths": paths, "method": method}
@@ -79,7 +73,6 @@ async def debug_try_paths(
 
 @router.get("/debug/realnex/timezones")
 async def debug_timezones():
-    """Lists RealNex-supported timezone keys."""
     token = get_rn_token()
     if not token:
         return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
@@ -90,11 +83,20 @@ async def debug_attachment_test(
     objectKey: str = Query(..., description="GUID of existing object (e.g., contactKey)"),
     url: str = Query(..., description="Publicly fetchable file URL to attach"),
 ):
-    """
-    Writes: fetches `url` and POSTs to /attachment/{objectKey}.
-    Use against known objects only. For test/debug.
-    """
     token = get_rn_token()
     if not token:
         raise HTTPException(status_code=500, detail="REALNEX_TOKEN/REALNEX_JWT not set")
     return await attach_recording_from_url(token, objectKey, url)
+
+@router.get("/debug/realnex/search_phone")
+async def debug_search_phone(phone: str = Query(..., description="Phone to search")):
+    """
+    Shows both: standard Contacts/search AND the OData wide fallback.
+    Useful to see which one your tenant supports for this record.
+    """
+    token = get_rn_token()
+    if not token:
+        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
+    std = await search_by_phone(token, phone)
+    wide = await search_contact_by_phone_wide(token, phone)
+    return {"standard": std, "wide": wide}

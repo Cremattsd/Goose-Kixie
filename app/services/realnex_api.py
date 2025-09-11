@@ -2,7 +2,6 @@
 import os, httpx, re, asyncio
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, unquote
-from datetime import datetime
 
 def get_rn_token() -> str:
     return os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN") or ""
@@ -22,11 +21,7 @@ def _bases_from_env() -> List[str]:
 BASES = _bases_from_env()
 
 def _headers(token: str) -> Dict[str,str]:
-    # No default Content-Type; set in _send based on payload type.
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True)
@@ -43,14 +38,12 @@ async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
     return data
 
 async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **kw) -> httpx.Response:
-    # Merge headers and set proper Content-Type when using json
     base_headers = _headers(token)
     extra_headers = kw.pop("headers", None)
     if "json" in kw and extra_headers is None:
         base_headers["Content-Type"] = "application/json"
     if extra_headers:
         base_headers.update({k: v for k, v in extra_headers.items() if v is not None})
-        # if caller explicitly passes Content-Type, we honor it
     req = client.build_request(method, url, headers=base_headers, **kw)
     return await client.send(req)
 
@@ -69,7 +62,7 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
                     return {"status": 599, "error": str(e), "attempted": url}
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
-# ---------- Utilities ----------
+# ---------- Phone utils ----------
 
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     if not raw: return None
@@ -79,6 +72,72 @@ def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     if digits.startswith("1") and len(digits)==11: return f"+{digits}"
     if raw.startswith("+"): return f"+{digits}"
     return f"+{digits}"
+
+def digits_only(raw: Optional[str]) -> Optional[str]:
+    if not raw: return None
+    d = re.sub(r"\D+", "", raw)
+    return d or None
+
+# ---------- Contacts & History ----------
+
+async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
+    return await _try_paths("GET",
+        ["Contacts/search","Contact/search","contacts/search","contact/search"],
+        token, params={"phone": phone_e164})
+
+# NEW: wide search via OData contains() across common phone fields
+_ODATA_CONTACT_PATHS = [
+    "CrmOData/Contacts","crmodata/Contacts","OData/Contacts","odata/Contacts"
+]
+_PHONE_FIELDS = [
+    "PrimaryPhone","MobilePhone","BusinessPhone","HomePhone",
+    "WorkPhone","CellPhone","Phone","Phone1","Phone2","Phone3",
+    "OtherPhone","AssistantPhone","Fax"
+]
+
+async def search_contact_by_phone_wide(token: str, phone_raw: str) -> Dict[str, Any]:
+    """
+    Fallback: if Contacts/search misses, probe OData Contacts with contains()
+    on many phone fields using digits-only token (robust to formatting).
+    Returns the raw response of the first non-404 hit; may include .value list.
+    """
+    d = digits_only(phone_raw)
+    if not d:
+        return {"status": 400, "error": "no_digits"}
+    # Build $filter like: contains(PrimaryPhone,'8584581063') or contains(MobilePhone,'8584581063') ...
+    flt = " or ".join([f"contains({f},'{d}')" for f in _PHONE_FIELDS])
+    params = {"$filter": flt, "$top": "1"}
+    return await _try_paths("GET", _ODATA_CONTACT_PATHS, token, params=params)
+
+async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    return await _try_paths("POST",
+        ["contact","Contact","contacts","Contacts"],
+        token, json=payload)
+
+async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
+    return await _try_paths("POST",
+        ["history","History","histories","Histories"],
+        token, json=payload)
+
+# ---------- Timezones ----------
+
+async def list_timezones(token: str) -> Dict[str, Any]:
+    return await _try_paths("GET",
+        ["timezones","Timezones","CRM/timezones","CRM/Timezones"],
+        token)
+
+async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
+    if not tz: return False
+    data = await list_timezones(token)
+    vals = data.get("data") or data.get("value") or data
+    try:
+        tzs = { (x.get("Key") or x.get("Id") or x.get("name") or x.get("Name") or x).strip()
+               for x in (vals if isinstance(vals, list) else []) }
+    except Exception:
+        tzs = set()
+    return tz in tzs if tzs else True
+
+# ---------- Attachments ----------
 
 def _basename_from_url(u: str) -> str:
     try:
@@ -95,46 +154,8 @@ def _guess_content_type(name: str, fallback: Optional[str]) -> str:
     if ext == "wav": return "audio/wav"
     if ext == "ogg": return "audio/ogg"
     if fallback:
-        # strip params like "; charset=..."
         return fallback.split(";")[0].strip()
     return "application/octet-stream"
-
-# ---------- Contacts & History ----------
-
-async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
-    return await _try_paths("GET",
-        ["Contacts/search","Contact/search","contacts/search","contact/search"],
-        token, params={"phone": phone_e164})
-
-async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    return await _try_paths("POST",
-        ["contact","Contact","contacts","Contacts"],
-        token, json=payload)
-
-async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    return await _try_paths("POST",
-        ["history","History","histories","Histories"],
-        token, json=payload)
-
-# ---------- Timezones (list/validate) ----------
-
-async def list_timezones(token: str) -> Dict[str, Any]:
-    return await _try_paths("GET",
-        ["timezones","Timezones","CRM/timezones","CRM/Timezones"],
-        token)
-
-async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
-    if not tz: return False
-    data = await list_timezones(token)
-    vals = data.get("data") or data.get("value") or data
-    try:
-        tzs = { (x.get("Key") or x.get("Id") or x.get("name") or x.get("Name") or x).strip()
-               for x in (vals if isinstance(vals, list) else []) }
-    except Exception:
-        tzs = set()
-    return tz in tzs if tzs else True  # if API doesn’t list, assume ok
-
-# ---------- Attachments ----------
 
 async def fetch_url_bytes(url: str) -> Dict[str, Any]:
     async with _client() as client:
@@ -144,14 +165,12 @@ async def fetch_url_bytes(url: str) -> Dict[str, Any]:
         ct = r.headers.get("content-type", "")
         name = _basename_from_url(url)
         if "." not in name:
-            # add default ext when obvious
             if "mpeg" in ct: name += ".mp3"
             elif "wav" in ct: name += ".wav"
         return {"bytes": content, "content_type": _guess_content_type(name, ct), "filename": name, "status": r.status_code}
 
 async def upload_attachment(token: str, object_key: str, filename: str, content_type: str, data: bytes) -> Dict[str, Any]:
     files = {"file": (filename, data, content_type)}
-    # Do not set Content-Type header (httpx will set multipart)
     return await _try_paths("POST",
         [f"attachment/{object_key}", f"Attachment/{object_key}", f"attachments/{object_key}", f"Attachments/{object_key}"],
         token, files=files)
@@ -165,69 +184,7 @@ async def attach_recording_from_url(token: str, object_key: str, recording_url: 
     except Exception as e:
         return {"status": 500, "error": str(e)}
 
-# ---------- Resolve user/team by email (optional helpers) ----------
-
-_USER_LIST_PATHS = ["users","Users","CRM/users","CRM/Users"]
-_TEAM_LIST_PATHS = ["teams","Teams","CRM/teams","CRM/Teams"]
-
-_ODATA_USER_COLLECTIONS = [
-    "CrmOData/Users", "CrmOData/users", "crmodata/Users", "crmodata/users",
-    "OData/Users", "odata/Users",
-]
-_ODATA_TEAM_COLLECTIONS = [
-    "CrmOData/Teams", "CrmOData/teams", "crmodata/Teams", "crmodata/teams",
-    "OData/Teams", "odata/Teams",
-]
-
-_USER_KEY_FIELDS = ["Key","Id","id","UserKey","userKey","UserId","userId"]
-_TEAM_KEY_FIELDS = ["TeamKey","teamKey","Key","Id","id"]
-_EMAIL_FIELDS = ["Email","email","UserEmail","Username","username","Login","login"]
-
-_user_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-_user_lock = asyncio.Lock()
-
-def _cache_key(email: str) -> str:
-    return email.lower().strip()
-
-def _pluck_any(d: Dict[str,Any], names: List[str]) -> Optional[str]:
-    for n in names:
-        if n in d and d[n]:
-            return str(d[n])
-    return None
-
-async def _first_ok(method: str, rel_paths: List[str], token: str):
-    async with _client() as client:
-        for base in BASES:
-            for p in rel_paths:
-                url = f"{base}/{p}"
-                try:
-                    r = await _send(client, method, url, token)
-                    if r.status_code < 400:
-                        try:
-                            return (url, r.json())
-                        except Exception:
-                            return (url, None)
-                except httpx.HTTPError:
-                    continue
-    return (None, None)
-
-async def _odata_first(client: httpx.AsyncClient, base: str, path: str, token: str, params: Dict[str,str]):
-    url = f"{base}/{path}"
-    try:
-        r = await _send(client, "GET", url, token, params=params)
-        if r.status_code == 404:
-            return None
-        data = await _format_resp(r)
-        if isinstance(data.get("value"), list) and data["value"]:
-            return data["value"][0]
-        d = {k:v for k,v in data.items() if k not in ("status","url","method")}
-        return d or None
-    except httpx.HTTPError:
-        return None
-
-def _odata_filter(email: str) -> Dict[str,str]:
-    conds = [f"{f} eq '{email}'" for f in _EMAIL_FIELDS]
-    return {"$filter": " or ".join(conds), "$top": "1"}
+# ---------- Probe ----------
 
 async def probe_endpoints(token: str) -> Dict[str, Any]:
     shapes = [
@@ -235,7 +192,7 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
         "Contact","History","Users","Teams",
         "CrmOData/Users","CrmOData/Teams","crmodata/Users","crmodata/Teams",
         "OData/Users","OData/Teams","CRM/Users","CRM/Teams",
-        "timezones","Timezones","attachment/test-key"
+        "timezones","Timezones","attachment/test-key","CrmOData/Contacts"
     ]
     out = {"bases": BASES, "checks": []}
     async with _client() as client:
