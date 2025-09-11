@@ -2,10 +2,17 @@ import os, httpx, re, asyncio
 from typing import Any, Dict, Optional, List
 from urllib.parse import urlparse, unquote
 
+# ---------- Auth / Bases ----------
+
 def get_rn_token() -> str:
     return os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN") or ""
 
 def _bases_from_env() -> List[str]:
+    """
+    REALNEX_API_BASE can be a single base or comma-separated bases.
+    If it ends with /Crm, we auto-add common siblings so the app can
+    adapt to different tenant shapes.
+    """
     raw = os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm")
     parts = [p.strip().rstrip("/") for p in raw.split(",") if p.strip()]
     if len(parts) == 1:
@@ -18,6 +25,12 @@ def _bases_from_env() -> List[str]:
     return parts
 
 BASES = _bases_from_env()
+
+def _odata_bases() -> List[str]:
+    """Return only bases that look like OData collections."""
+    return [b for b in BASES if b.lower().endswith("/crmoodata") or b.lower().endswith("/crmodata")]
+
+# ---------- HTTP helpers ----------
 
 def _headers(token: str) -> Dict[str,str]:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -36,6 +49,20 @@ async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
         data.setdefault("method", resp.request.method)
     return data
 
+def _join_base_path(base: str, path: str) -> str:
+    """
+    Safe join so we never double the segment (e.g., CrmOData/CrmOData/...).
+    """
+    base = base.rstrip("/")
+    path = (path or "").lstrip("/")
+    if not path:
+        return base
+    btail = base.rsplit("/", 1)[-1].lower()
+    phead = path.split("/", 1)[0].lower()
+    if btail == phead:
+        path = path.split("/", 1)[1] if "/" in path else ""
+    return f"{base}/{path}" if path else base
+
 async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **kw) -> httpx.Response:
     base_headers = _headers(token)
     extra_headers = kw.pop("headers", None)
@@ -47,11 +74,15 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **
     return await client.send(req)
 
 async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[str,Any]:
+    """
+    Legacy behavior: return first response that is NOT 404.
+    Use this when probing variable tenant shapes, BUT NOT for validation-sensitive lookups.
+    """
     async with _client() as client:
         last = None
         for base in BASES:
             for path in paths:
-                url = f"{base}/{path}"
+                url = _join_base_path(base, path)
                 try:
                     r = await _send(client, method, url, token, **kw)
                     if r.status_code != 404:
@@ -61,7 +92,43 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
                     return {"status": 599, "error": str(e), "attempted": url}
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
+async def _try_paths_status_ok(method: str, paths: List[str], token: str, **kw) -> Dict[str,Any]:
+    """
+    Strict success: return first **2xx** response. This avoids treating 400s as 'hits'.
+    Use for endpoints like Contact/search where some tenants 400 on bad shapes.
+    """
+    async with _client() as client:
+        last = None
+        for base in BASES:
+            for path in paths:
+                url = _join_base_path(base, path)
+                try:
+                    r = await _send(client, method, url, token, **kw)
+                    last = r
+                    if 200 <= r.status_code < 300:
+                        return await _format_resp(r)
+                except httpx.HTTPError as e:
+                    return {"status": 599, "error": str(e), "attempted": url}
+        return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
+
+async def _try_paths_over_bases_status_ok(method: str, paths: List[str], bases: List[str], token: str, **kw) -> Dict[str,Any]:
+    """Same strict 2xx rule, but only over the given bases (used for OData)."""
+    async with _client() as client:
+        last = None
+        for base in bases:
+            for path in paths:
+                url = _join_base_path(base, path)
+                try:
+                    r = await _send(client, method, url, token, **kw)
+                    last = r
+                    if 200 <= r.status_code < 300:
+                        return await _format_resp(r)
+                except httpx.HTTPError as e:
+                    return {"status": 599, "error": str(e), "attempted": url}
+        return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
+
 # ---------- Phone utils ----------
+
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     if not raw: return None
     digits = re.sub(r"\D+", "", raw)
@@ -77,14 +144,18 @@ def digits_only(raw: Optional[str]) -> Optional[str]:
     return d or None
 
 # ---------- Contacts & History ----------
-async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
-    return await _try_paths("GET",
-        ["Contacts/search","Contact/search","contacts/search","contact/search"],
-        token, params={"phone": phone_e164})
 
-_ODATA_CONTACT_PATHS = [
-    "CrmOData/Contacts","crmodata/Contacts","OData/Contacts","odata/Contacts"
-]
+async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
+    """
+    Strict 2xx success so a tenant that returns 400 on /Contact/search won't short-circuit.
+    """
+    return await _try_paths_status_ok(
+        "GET",
+        ["Contacts/search","contacts/search","Contact/search","contact/search"],
+        token,
+        params={"phone": phone_e164},
+    )
+
 _PHONE_FIELDS = [
     "PrimaryPhone","MobilePhone","BusinessPhone","HomePhone",
     "WorkPhone","CellPhone","Phone","Phone1","Phone2","Phone3",
@@ -92,12 +163,20 @@ _PHONE_FIELDS = [
 ]
 
 async def search_contact_by_phone_wide(token: str, phone_raw: str) -> Dict[str, Any]:
+    """
+    OData fallback: search Contacts across common phone fields with contains(digits).
+    Only runs against OData bases to avoid malformed joins.
+    """
     d = digits_only(phone_raw)
     if not d:
         return {"status": 400, "error": "no_digits"}
     flt = " or ".join([f"contains({f},'{d}')" for f in _PHONE_FIELDS])
     params = {"$filter": flt, "$top": "1"}
-    return await _try_paths("GET", _ODATA_CONTACT_PATHS, token, params=params)
+    odata_bases = _odata_bases()
+    if not odata_bases:
+        return {"status": 404, "error": "no_odata_bases", "bases": BASES}
+    # Path is just 'Contacts'; _join_base_path will do the right thing for CrmOData/crmodata.
+    return await _try_paths_over_bases_status_ok("GET", ["Contacts"], odata_bases, token, params=params)
 
 async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
     return await _try_paths("POST",
@@ -109,7 +188,7 @@ async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
         ["history","History","histories","Histories"],
         token, json=payload)
 
-# >>> NEW: get contact (basic) and full variants <<<
+# Read a contact (basic & full)
 async def get_contact(token: str, contact_key: str) -> Dict[str, Any]:
     k = contact_key
     paths = [
@@ -127,6 +206,7 @@ async def get_contact_full(token: str, contact_key: str) -> Dict[str, Any]:
     return await _try_paths("GET", paths, token)
 
 # ---------- Timezones ----------
+
 async def list_timezones(token: str) -> Dict[str, Any]:
     return await _try_paths("GET",
         ["timezones","Timezones","CRM/timezones","CRM/Timezones"],
@@ -138,12 +218,13 @@ async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
     vals = data.get("data") or data.get("value") or data
     try:
         tzs = { (x.get("Key") or x.get("Id") or x.get("name") or x.get("Name") or x).strip()
-               for x in (vals if isinstance(vals, list) else []) }
+                for x in (vals if isinstance(vals, list) else []) }
     except Exception:
         tzs = set()
-    return tz in tzs if tzs else True
+    return tz in tzs if tzs else True  # permissive if API doesn't enumerate
 
 # ---------- Attachments ----------
+
 def _basename_from_url(u: str) -> str:
     try:
         path = urlparse(u).path
@@ -190,19 +271,21 @@ async def attach_recording_from_url(token: str, object_key: str, recording_url: 
         return {"status": 500, "error": str(e)}
 
 # ---------- Probe ----------
+
 async def probe_endpoints(token: str) -> Dict[str, Any]:
     shapes = [
         "contact","history","users","teams",
         "Contact","History","Users","Teams",
         "CrmOData/Users","CrmOData/Teams","crmodata/Users","crmodata/Teams",
         "OData/Users","OData/Teams","CRM/Users","CRM/Teams",
-        "timezones","Timezones","attachment/test-key","CrmOData/Contacts"
+        "timezones","Timezones","attachment/test-key",
+        "CrmOData/Contacts","crmodata/Contacts"
     ]
     out = {"bases": BASES, "checks": []}
     async with _client() as client:
         for base in BASES:
             for path in shapes:
-                url = f"{base}/{path}"
+                url = _join_base_path(base, path)
                 try:
                     r = await _send(client, "OPTIONS", url, token)
                     out["checks"].append({"url": url, "status": r.status_code})
