@@ -1,6 +1,8 @@
-import os, httpx, re, asyncio
-from typing import Any, Dict, Optional, List
+import os, re, base64, asyncio, httpx
+from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, unquote
+
+# ─────────────── Token & Bases ───────────────
 
 def get_rn_token() -> str:
     return os.getenv("REALNEX_JWT") or os.getenv("REALNEX_TOKEN") or ""
@@ -13,13 +15,13 @@ def _bases_from_env() -> List[str]:
         variants = [b]
         if b.lower().endswith("/crm"):
             root = b[:-4]
-            variants += [root + "/CrmOData", root + "/CRM", root + "/crmodata"]
+            variants += [root + "/CrmOData", root + "/CRM", root + "/crmodata", root + "/odata"]
         parts = variants
     return parts
 
 BASES = _bases_from_env()
 
-def _headers(token: str) -> Dict[str,str]:
+def _headers(token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 def _client() -> httpx.AsyncClient:
@@ -29,7 +31,7 @@ async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
     try:
         data = resp.json() if resp.content else {}
     except Exception:
-        data = {"raw": (await resp.aread()).decode("utf-8","ignore")}
+        data = {"raw": (await resp.aread()).decode("utf-8", "ignore")}
     if isinstance(data, dict):
         data.setdefault("status", resp.status_code)
         data.setdefault("url", str(resp.request.url))
@@ -46,14 +48,15 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **
     req = client.build_request(method, url, headers=base_headers, **kw)
     return await client.send(req)
 
-async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[str,Any]:
+async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[str, Any]:
     async with _client() as client:
-        last = None
+        last: Optional[httpx.Response] = None
         for base in BASES:
             for path in paths:
-                url = f"{base}/{path}"
+                url = f"{base}/{path.lstrip('/')}"
                 try:
                     r = await _send(client, method, url, token, **kw)
+                    # We return on first non-404 (so we can bubble 400s to the caller)
                     if r.status_code != 404:
                         return await _format_resp(r)
                     last = r
@@ -61,148 +64,245 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
                     return {"status": 599, "error": str(e), "attempted": url}
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
-# ---------- Phone utils ----------
+# ─────────────── Phone utils ───────────────
+
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
-    if not raw: return None
+    if not raw:
+        return None
     digits = re.sub(r"\D+", "", raw)
-    if not digits: return None
-    if len(digits) == 10: return f"+1{digits}"
-    if digits.startswith("1") and len(digits)==11: return f"+{digits}"
-    if raw.startswith("+"): return f"+{digits}"
+    if not digits:
+        return None
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if digits.startswith("1") and len(digits) == 11:
+        return f"+{digits}"
+    if raw.startswith("+"):
+        return f"+{digits}"
     return f"+{digits}"
 
 def digits_only(raw: Optional[str]) -> Optional[str]:
-    if not raw: return None
+    if not raw:
+        return None
     d = re.sub(r"\D+", "", raw)
     return d or None
 
-# ---------- Contacts & History ----------
-async def search_by_phone(token: str, phone_e164: str) -> Dict[str,Any]:
-    # Many tenants do NOT support this route; if 400/404 we'll fall back to OData probing.
-    return await _try_paths("GET",
-        ["Contacts/search","Contact/search","contacts/search","contact/search"],
-        token, params={"phone": phone_e164})
+# ─────────────── CRM: Contacts & History ───────────────
 
-# OData contact collections (varies by tenant)
-_ODATA_CONTACT_PATHS = [
-    "CrmOData/Contacts",
-    "crmodata/Contacts",
-    "CrmOData/odata/Contacts",
-    "crmodata/odata/Contacts",
-    "OData/Contacts",
-    "odata/Contacts",
-]
+async def search_by_phone(token: str, phone_e164: str) -> Dict[str, Any]:
+    # Only accept a clean 2xx; otherwise let caller try OData
+    resp = await _try_paths(
+        "GET",
+        ["Contacts/search", "Contact/search", "contacts/search", "contact/search"],
+        token,
+        params={"phone": phone_e164},
+    )
+    if int(resp.get("status", 0)) // 100 == 2:
+        return resp
+    return {"status": resp.get("status", 400), "error": "crm_search_failed", "raw": resp}
 
-# We will PROBE these candidates one-by-one; only valid fields will succeed.
-_CANDIDATE_PHONE_FIELDS = [
-    "Phone","Phone1","Phone2","Phone3",
-    "Mobile","MobilePhone","CellPhone",
-    "BusinessPhone","WorkPhone","HomePhone","OtherPhone","AssistantPhone","Fax",
-    "PrimaryPhone","Telephone","Telephone1","Telephone2"
-]
+async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await _try_paths("POST", ["contact", "Contact", "contacts", "Contacts"], token, json=payload)
 
-async def _odata_try_field(
-    client: httpx.AsyncClient,
-    base: str,
-    collection: str,
-    token: str,
-    digits: str,
-    top: int = 1
-) -> Dict[str, Any]:
-    attempts: List[Dict[str, Any]] = []
-    for field in _CANDIDATE_PHONE_FIELDS:
-        flt = f"contains({field},'{digits}')"
-        url = f"{base}/{collection}"
-        try:
-            r = await _send(client, "GET", url, token, params={"$filter": flt, "$top": str(top)})
-            body = await _format_resp(r)
-            attempts.append({"field": field, "status": body.get("status"), "url": body.get("url")})
-            # Success path: 2xx and a non-empty value list
-            vals = body.get("value")
-            if r.status_code < 300 and isinstance(vals, list) and vals:
-                return {"match": True, "field": field, "body": body, "attempts": attempts}
-            # 400 when field doesn't exist -> keep trying others
-        except httpx.HTTPError as e:
-            attempts.append({"field": field, "error": str(e), "url": f"{url}?$filter={flt}&$top={top}"})
-            continue
-    return {"match": False, "attempts": attempts}
+async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await _try_paths("POST", ["history", "History", "histories", "Histories"], token, json=payload)
 
-async def search_contact_by_phone_wide(token: str, phone_raw: str, top: int = 1) -> Dict[str, Any]:
-    """
-    Robust OData fallback: probe many phone-like fields across common OData collections.
-    Returns the FIRST successful 2xx response with non-empty 'value'.
-    Includes 'attempts' for debugging visibility.
-    """
-    d = digits_only(phone_raw)
-    if not d:
-        return {"status": 400, "error": "no_digits"}
-
-    out: Dict[str, Any] = {"status": 404, "attempts": []}
-    async with _client() as client:
-        for base in BASES:
-            for coll in _ODATA_CONTACT_PATHS:
-                res = await _odata_try_field(client, base, coll, token, d, top=top)
-                out["attempts"].extend(res.get("attempts", []))
-                if res.get("match"):
-                    body = res["body"]
-                    # Mirror _format_resp shape (status/url/method already present)
-                    return {
-                        "status": body.get("status", 200),
-                        "url": body.get("url"),
-                        "method": body.get("method"),
-                        "value": body.get("value", []),
-                        "matched_field": res.get("field"),
-                        "collection": coll,
-                        "base": base,
-                        "attempts": out["attempts"],
-                    }
-    return out
-
-async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    return await _try_paths("POST",
-        ["contact","Contact","contacts","Contacts"],
-        token, json=payload)
-
-async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str,Any]:
-    return await _try_paths("POST",
-        ["history","History","histories","Histories"],
-        token, json=payload)
-
-# ---------- Contact reads ----------
 async def get_contact(token: str, contact_key: str) -> Dict[str, Any]:
     k = contact_key
-    paths = [
-        f"contact/{k}", f"Contact/{k}", f"contacts/{k}", f"Contacts/{k}",
-        f"CRM/contact/{k}", f"CRM/Contact/{k}",
-    ]
+    paths = [f"contact/{k}", f"Contact/{k}", f"contacts/{k}", f"Contacts/{k}", f"CRM/contact/{k}", f"CRM/Contact/{k}"]
     return await _try_paths("GET", paths, token)
 
 async def get_contact_full(token: str, contact_key: str) -> Dict[str, Any]:
     k = contact_key
     paths = [
-        f"contact/{k}/full", f"Contact/{k}/full", f"contacts/{k}/full", f"Contacts/{k}/full",
-        f"CRM/contact/{k}/full", f"CRM/Contact/{k}/full",
+        f"contact/{k}/full",
+        f"Contact/{k}/full",
+        f"contacts/{k}/full",
+        f"Contacts/{k}/full",
+        f"CRM/contact/{k}/full",
+        f"CRM/Contact/{k}/full",
     ]
     return await _try_paths("GET", paths, token)
 
-# ---------- Timezones ----------
+# ─────────────── CRM: Definitions & Timezones ───────────────
+
+async def get_table_definition(token: str, table: str) -> Dict[str, Any]:
+    return await _try_paths("GET", [f"definitions/{table}", f"CRM/definitions/{table}"], token)
+
 async def list_timezones(token: str) -> Dict[str, Any]:
-    return await _try_paths("GET",
-        ["timezones","Timezones","CRM/timezones","CRM/Timezones"],
-        token)
+    return await _try_paths("GET", ["timezones", "Timezones", "CRM/timezones", "CRM/Timezones"], token)
 
 async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
-    if not tz: return False
+    if not tz:
+        return False
     data = await list_timezones(token)
     vals = data.get("data") or data.get("value") or data
     try:
-        tzs = { (x.get("Key") or x.get("Id") or x.get("name") or x.get("Name") or x).strip()
-               for x in (vals if isinstance(vals, list) else []) }
+        tzs = {
+            (x.get("Key") or x.get("Id") or x.get("name") or x.get("Name") or x).strip()
+            for x in (vals if isinstance(vals, list) else [])
+        }
     except Exception:
         tzs = set()
     return tz in tzs if tzs else True
 
-# ---------- Attachments ----------
+# ─────────────── OData: Contacts (probe fields, then filter) ───────────────
+
+_ODATA_CONTACT_COLLECTIONS = [
+    "CrmOData/Contacts",
+    "crmodata/Contacts",
+    "OData/Contacts",
+    "odata/Contacts",
+]
+
+async def _odata_field_is_selectable(token: str, field: str) -> bool:
+    # Try each collection with $select=field&$top=1; accept 2xx/3xx as valid
+    async with _client() as client:
+        for base in BASES:
+            for coll in _ODATA_CONTACT_COLLECTIONS:
+                url = f"{base}/{coll}?$select={field}&$top=1"
+                try:
+                    r = await _send(client, "GET", url, token)
+                    if r.status_code < 400:
+                        return True
+                    # 400 with "Could not find a property named" means invalid — keep trying other bases/collections
+                except httpx.HTTPError:
+                    pass
+    return False
+
+def _like_phone_name(name: str) -> bool:
+    n = name.lower()
+    # Broad, but we’ll validate with _odata_field_is_selectable anyway
+    return any(
+        kw in n
+        for kw in [
+            "phone",
+            "mobile",
+            "cell",
+            "workphone",
+            "homephone",
+            "assistant",
+            "fax",
+            "telephone",
+        ]
+    )
+
+def _safe_field_name(x: Any) -> Optional[str]:
+    # Definitions may return different casing/keys; extract a plausible field name
+    if isinstance(x, dict):
+        for k in ("Name", "name", "Field", "field", "ApiName", "apiName"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if isinstance(x, str) and x.strip():
+        return x.strip()
+    return None
+
+async def probe_odata_phone_fields(token: str) -> List[str]:
+    """
+    1) Pull field definitions for Contacts (CRM definitions endpoint).
+    2) Keep fields whose name smells like phone.
+    3) Validate each candidate against OData via $select to avoid "property not found".
+    """
+    defs = await get_table_definition(token, "Contacts")
+    items = defs.get("data") or defs.get("fields") or defs.get("value") or defs
+    candidates = []
+    if isinstance(items, list):
+        for it in items:
+            name = _safe_field_name(it)
+            if name and _like_phone_name(name):
+                candidates.append(name)
+
+    validated: List[str] = []
+    for f in candidates:
+        if await _odata_field_is_selectable(token, f):
+            validated.append(f)
+
+    # Always include a couple very common possibilities if they validate
+    for f in ["PrimaryPhone", "MobilePhone"]:
+        if f not in validated and await _odata_field_is_selectable(token, f):
+            validated.append(f)
+
+    return validated
+
+async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
+    """
+    Build a $filter OR of contains(Field, 'digits') across validated fields. Try each OData collection until one responds.
+    """
+    if not fields:
+        return {"status": 404, "error": "no_valid_phone_fields"}
+    flt = " or ".join([f"contains({f},'{digits}')" for f in fields])
+    params = {"$filter": flt, "$top": str(top)}
+    return await _try_paths("GET", _ODATA_CONTACT_COLLECTIONS, token, params=params)
+
+async def search_contact_keys_by_phone_two_stage(token: str, phone_raw: str) -> Dict[str, Any]:
+    """
+    Two-stage:
+    - Stage A: OData probe to find candidate contact keys by digits across real (validated) phone fields.
+    - Stage B: For each candidate key, GET CRM contact (basic) and confirm the phone digits actually appear
+      in one of the contact’s detailed phone fields. Return the first confirmed key.
+    """
+    digits = digits_only(phone_raw) or ""
+    if not digits:
+        return {"status": 400, "error": "no_digits"}
+
+    # Probe & OData query
+    fields = await probe_odata_phone_fields(token)
+    wide = await odata_contacts_filter_by_digits(token, digits, fields, top=10)
+    if int(wide.get("status", 0)) // 100 != 2:
+        return {"status": 404, "error": "odata_no_match", "probe_fields": fields, "wide": wide}
+
+    values = wide.get("value") or wide.get("data") or []
+    if not isinstance(values, list) or not values:
+        return {"status": 404, "error": "odata_empty", "probe_fields": fields}
+
+    # Extract candidate keys
+    cand_keys = []
+    for v in values:
+        if isinstance(v, dict):
+            k = v.get("Key") or v.get("key") or v.get("Id") or v.get("id")
+            if k:
+                cand_keys.append(str(k))
+
+    # Verify each candidate with CRM
+    def _has_digits(d: Dict[str, Any], digits: str) -> bool:
+        if not isinstance(d, dict):
+            return False
+        # check a bunch of plausible fields
+        for n in d.keys():
+            if "phone" in n.lower() or n.lower() in {"fax"}:
+                s = str(d.get(n) or "")
+                if digits in re.sub(r"\D+", "", s):
+                    return True
+        return False
+
+    for ck in cand_keys:
+        detail = await get_contact(token, ck)  # use basic to minimize payload
+        if int(detail.get("status", 0)) // 100 == 2:
+            body = detail.get("data") or detail
+            if isinstance(body, dict):
+                # The CRM response may wrap; normalize to a dict of fields
+                # if it includes nested structures, try a shallow flatten
+                check_dict = {}
+                for k, v in body.items():
+                    if isinstance(v, (str, int)):
+                        check_dict[k] = v
+                    elif isinstance(v, dict):
+                        # pull phone-ish leaves
+                        for kk, vv in v.items():
+                            if isinstance(vv, (str, int)):
+                                check_dict[f"{k}.{kk}"] = vv
+                if _has_digits(check_dict, digits):
+                    return {
+                        "status": 200,
+                        "contactKey": ck,
+                        "probe_fields": fields,
+                        "confirmed_by": "CRM contact basic",
+                    }
+
+    return {"status": 404, "error": "no_candidate_verified", "probe_fields": fields, "candidates": cand_keys}
+
+# ─────────────── Attachments (JSON body per Swagger) ───────────────
+
 def _basename_from_url(u: str) -> str:
     try:
         path = urlparse(u).path
@@ -213,10 +313,14 @@ def _basename_from_url(u: str) -> str:
 
 def _guess_content_type(name: str, fallback: Optional[str]) -> str:
     ext = (name.rsplit(".", 1)[-1].lower() if "." in name else "")
-    if ext == "mp3": return "audio/mpeg"
-    if ext in ("m4a","mp4"): return "audio/mp4"
-    if ext == "wav": return "audio/wav"
-    if ext == "ogg": return "audio/ogg"
+    if ext == "mp3":
+        return "audio/mpeg"
+    if ext in ("m4a", "mp4"):
+        return "audio/mp4"
+    if ext == "wav":
+        return "audio/wav"
+    if ext == "ogg":
+        return "audio/ogg"
     if fallback:
         return fallback.split(";")[0].strip()
     return "application/octet-stream"
@@ -229,33 +333,68 @@ async def fetch_url_bytes(url: str) -> Dict[str, Any]:
         ct = r.headers.get("content-type", "")
         name = _basename_from_url(url)
         if "." not in name:
-            if "mpeg" in ct: name += ".mp3"
-            elif "wav" in ct: name += ".wav"
+            if "mpeg" in ct:
+                name += ".mp3"
+            elif "wav" in ct:
+                name += ".wav"
         return {"bytes": content, "content_type": _guess_content_type(name, ct), "filename": name, "status": r.status_code}
 
-async def upload_attachment(token: str, object_key: str, filename: str, content_type: str, data: bytes) -> Dict[str, Any]:
-    files = {"file": (filename, data, content_type)}
-    return await _try_paths("POST",
-        [f"attachment/{object_key}", f"Attachment/{object_key}", f"attachments/{object_key}", f"Attachments/{object_key}"],
-        token, files=files)
+async def upload_attachment_json(token: str, object_key: str, filename: str, content_type: str, data: bytes) -> Dict[str, Any]:
+    # Per Swagger: JSON body with base64 + mediaType
+    b64 = base64.b64encode(data).decode("ascii")
+    body = {
+        # You may optionally include userKey/teamKey if you want to attribute
+        "file": {
+            "fileName": filename,
+            "fileContent": b64,
+            "mediaType": content_type,
+        },
+        # "description": "Call recording",
+        # "attachmentTypeKey": 0,
+        # "attachmentDate": datetime.utcnow().isoformat() + "Z",
+        # "picture": False,
+    }
+    return await _try_paths(
+        "POST",
+        [f"attachment/{object_key}", f"Attachment/{object_key}"],
+        token,
+        json=body,
+    )
 
 async def attach_recording_from_url(token: str, object_key: str, recording_url: str) -> Dict[str, Any]:
     try:
         fetched = await fetch_url_bytes(recording_url)
         if fetched.get("status", 0) >= 400:
             return {"status": fetched.get("status", 500), "error": "fetch_failed", "fetch": fetched}
-        return await upload_attachment(token, object_key, fetched["filename"], fetched["content_type"], fetched["bytes"])
+        return await upload_attachment_json(token, object_key, fetched["filename"], fetched["content_type"], fetched["bytes"])
     except Exception as e:
         return {"status": 500, "error": str(e)}
 
-# ---------- Probe ----------
+# ─────────────── Probe (debug) ───────────────
+
 async def probe_endpoints(token: str) -> Dict[str, Any]:
     shapes = [
-        "contact","history","users","teams",
-        "Contact","History","Users","Teams",
-        "CrmOData/Users","CrmOData/Teams","crmodata/Users","crmodata/Teams",
-        "OData/Users","OData/Teams","CRM/Users","CRM/Teams",
-        "timezones","Timezones","attachment/test-key","CrmOData/Contacts"
+        "contact",
+        "history",
+        "users",
+        "teams",
+        "Contact",
+        "History",
+        "Users",
+        "Teams",
+        "CrmOData/Users",
+        "CrmOData/Teams",
+        "crmodata/Users",
+        "crmodata/Teams",
+        "OData/Users",
+        "OData/Teams",
+        "CRM/Users",
+        "CRM/Teams",
+        "timezones",
+        "Timezones",
+        "attachment/test-key",
+        "CrmOData/Contacts",
+        "crmodata/Contacts",
     ]
     out = {"bases": BASES, "checks": []}
     async with _client() as client:
@@ -263,7 +402,7 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
             for path in shapes:
                 url = f"{base}/{path}"
                 try:
-                    r = await _send(client, "OPTIONS", url, token)
+                    r = await _send(client, "OPTIONS", url, get_rn_token())
                     out["checks"].append({"url": url, "status": r.status_code})
                 except Exception as e:
                     out["checks"].append({"url": url, "error": str(e)})

@@ -4,8 +4,9 @@ from typing import List, Dict, Any
 
 from ..services.realnex_api import (
     probe_endpoints, get_rn_token, BASES,
-    search_by_phone, search_contact_by_phone_wide,
-    get_contact, get_contact_full
+    get_table_definition,
+    probe_odata_phone_fields,
+    odata_contacts_filter_by_digits,
 )
 
 router = APIRouter()
@@ -30,7 +31,6 @@ def _join_base_path(base: str, path: str) -> str:
 
 @router.get("/debug/realnex/env")
 async def debug_env():
-    """Safe env flags (no secrets)."""
     return {
         "has_token": bool(get_rn_token()),
         "REALNEX_API_BASE": os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm"),
@@ -39,7 +39,6 @@ async def debug_env():
 
 @router.get("/debug/realnex/probe")
 async def debug_probe():
-    """OPTIONS probe of common endpoints across all bases."""
     token = get_rn_token()
     if not token:
         return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
@@ -47,18 +46,15 @@ async def debug_probe():
 
 @router.get("/debug/realnex/paths")
 async def debug_try_paths(
-    paths: List[str] = Query(..., description="Relative paths to try. Example: 'Users?$top=1' or 'CrmOData/Users?$top=1'"),
-    method: str = Query("GET", description="HTTP method to use (GET|OPTIONS)"),
+    paths: List[str] = Query(...),
+    method: str = Query("GET"),
 ):
-    """Try arbitrary relative paths across all bases. Helpful for odd tenant shapes."""
     token = get_rn_token()
     if not token:
         return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set", "paths": paths, "method": method}
-
     method = method.upper()
     if method not in {"OPTIONS", "GET"}:
         method = "GET"
-
     out: Dict[str, Any] = {"bases": BASES, "method": method, "paths": paths, "attempts": []}
     async with httpx.AsyncClient(timeout=20) as client:
         for base in BASES:
@@ -72,39 +68,36 @@ async def debug_try_paths(
                             body = {k: body[k] for k in list(body.keys())[:5]}
                     except Exception:
                         body = r.text[:500]
-                    out["attempts"].append({
-                        "url": url,
-                        "status": r.status_code,
-                        "body": body,
-                    })
+                    out["attempts"].append({"url": url, "status": r.status_code, "body": body})
                 except Exception as e:
                     out["attempts"].append({"url": url, "error": str(e)})
     return out
 
+# NEW: see contact field defs (so you can eyeball phone-esque names)
+@router.get("/debug/realnex/definitions/contacts")
+async def debug_defs_contacts():
+    token = get_rn_token()
+    if not token:
+        return {"status": "dry-run"}
+    return await get_table_definition(token, "Contacts")
+
+# NEW: what phone fields did we validate for OData?
+@router.get("/debug/realnex/odata/phone_fields")
+async def debug_odata_phone_fields():
+    token = get_rn_token()
+    if not token:
+        return {"status": "dry-run"}
+    fields = await probe_odata_phone_fields(token)
+    return {"fields": fields}
+
+# Optional: raw wide search by digits (uses probed fields)
 @router.get("/debug/realnex/search_phone")
-async def debug_search_phone(phone: str = Query(..., description="Phone number (any format)")):
-    """Shows both 'standard' search and the new OData probing fallback."""
+async def debug_search_phone(phone: str = Query(...)):
     token = get_rn_token()
     if not token:
-        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
-
-    std = await search_by_phone(token, phone)
-    wide = await search_contact_by_phone_wide(token, phone, top=1)
-    return {
-        "standard": std,
-        "wide": wide,
-    }
-
-@router.get("/debug/realnex/contact")
-async def debug_contact(contactKey: str = Query(..., description="Contact GUID")):
-    token = get_rn_token()
-    if not token:
-        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
-    return await get_contact(token, contactKey)
-
-@router.get("/debug/realnex/contact_full")
-async def debug_contact_full(contactKey: str = Query(..., description="Contact GUID")):
-    token = get_rn_token()
-    if not token:
-        return {"status": "dry-run", "reason": "REALNEX_TOKEN/REALNEX_JWT not set"}
-    return await get_contact_full(token, contactKey)
+        return {"status": "dry-run"}
+    from ..services.realnex_api import digits_only
+    d = digits_only(phone) or ""
+    fields = await probe_odata_phone_fields(token)
+    wide = await odata_contacts_filter_by_digits(token, d, fields, top=5)
+    return {"digits": d, "fields": fields, "wide": wide}
