@@ -145,13 +145,15 @@ async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
         tzs = set()
     return tz in tzs if tzs else True
 
-# ─────────────────── OData: Contacts (probe fields, then filter) ───────────────────
+# ─────────────────── OData: Contacts ───────────────────
 
 _ODATA_CONTACT_COLLECTIONS = ["Contacts"]
 
+# static-but-agnostic seeds; we’ll validate/select at runtime
 _STATIC_PHONE_FIELDS = [
+    "Mobile","Fax","DoNotFax",  # observed on ContactListItem
     "PrimaryPhone","MobilePhone","BusinessPhone","HomePhone","WorkPhone",
-    "CellPhone","Phone","Phone1","Phone2","Phone3","OtherPhone","AssistantPhone","Fax","Mobile"
+    "CellPhone","Phone","Phone1","Phone2","Phone3","OtherPhone","AssistantPhone"
 ]
 
 def _like_phone_name(name: str) -> bool:
@@ -168,6 +170,16 @@ def _safe_field_name(x: Any) -> Optional[str]:
         return x.strip()
     return None
 
+def _odata_norm_expr(field: str) -> str:
+    """
+    Normalize a field to digits-only inside OData:
+      cast(field,'Edm.String') -> strip ' ', '(', ')', '-', '+', '.'
+    """
+    s = f"cast({field},'Edm.String')"
+    for ch in [" ", "(", ")", "-", "+", "."]:
+        s = f"replace({s},'{ch}','')"
+    return s
+
 async def _odata_field_is_selectable(token: str, field: str) -> bool:
     async with _client() as client:
         for base in BASES:
@@ -180,32 +192,6 @@ async def _odata_field_is_selectable(token: str, field: str) -> bool:
                 except httpx.HTTPError:
                     pass
     return False
-
-async def _odata_field_supports_contains(token: str, field: str) -> Tuple[bool, bool]:
-    """
-    Returns (works_without_cast, works_with_cast). Tries a tiny filter that should parse.
-    """
-    test_digit = "0"
-    async with _client() as client:
-        for base in BASES:
-            for coll in _ODATA_CONTACT_COLLECTIONS:
-                # 1) raw contains
-                url1 = f"{base.rstrip('/')}/{coll}?$filter=contains({field},'{test_digit}')&$top=0"
-                try:
-                    r1 = await _send(client, "GET", url1, token)
-                    if r1.status_code < 400:
-                        return True, False
-                except httpx.HTTPError:
-                    pass
-                # 2) cast to string
-                url2 = f"{base.rstrip('/')}/{coll}?$filter=contains(cast({field},'Edm.String'),'{test_digit}')&$top=0"
-                try:
-                    r2 = await _send(client, "GET", url2, token)
-                    if r2.status_code < 400:
-                        return False, True
-                except httpx.HTTPError:
-                    pass
-    return False, False
 
 async def _odata_guess_phone_fields_from_sample(token: str) -> List[str]:
     async with _client() as client:
@@ -240,60 +226,42 @@ async def probe_odata_phone_fields(token: str) -> List[str]:
             name = _safe_field_name(it)
             if name and _like_phone_name(name):
                 candidates.append(name)
+    # Add static seeds to handle tenants that don't expose phone-ish names in definitions
+    for s in _STATIC_PHONE_FIELDS:
+        if s not in candidates:
+            candidates.append(s)
+    # Validate via $select
     validated: List[str] = []
     for f in candidates:
         if await _odata_field_is_selectable(token, f):
             validated.append(f)
+    # If still empty, infer from sample entity
     if not validated:
         inferred = await _odata_guess_phone_fields_from_sample(token)
         validated.extend([x for x in inferred if x not in validated])
-    for f in ["PrimaryPhone", "MobilePhone", "Mobile", "Fax"]:
-        if f not in validated and await _odata_field_is_selectable(token, f):
-            validated.append(f)
     return validated
-
-def _build_candidate_filters(digits: str, fields: List[str], cast_map: Dict[str, bool]) -> List[str]:
-    """
-    Build $filter candidates with per-field cast if needed.
-    cast_map[field] == True → use cast(field,'Edm.String')
-    """
-    parts: List[str] = []
-    for f in fields:
-        if cast_map.get(f):
-            parts.append(f"contains(cast({f},'Edm.String'),'{digits}')")
-        else:
-            parts.append(f"contains({f},'{digits}')")
-    return [" or ".join(parts)] if parts else []
 
 async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
     if not fields:
         return {"status": 404, "error": "no_valid_phone_fields"}
-    # Preflight each field to see whether contains() parses, with or without cast
-    cast_map: Dict[str, bool] = {}
-    usable: List[str] = []
-    for f in fields:
-        raw_ok, cast_ok = await _odata_field_supports_contains(token, f)
-        if raw_ok or cast_ok:
-            usable.append(f)
-            cast_map[f] = cast_ok and not raw_ok
-    if not usable:
+    # Build one composite filter using normalized fields (digits-only)
+    exprs = [f"contains({_odata_norm_expr(f)},'{digits}')" for f in fields]
+    if not exprs:
         return {"status": 404, "error": "no_filterable_phone_fields", "fields_tried": fields}
-    filters = _build_candidate_filters(digits, usable, cast_map)
-    params = {"$filter": filters[0], "$top": str(top)}
+    flt = " or ".join(exprs)
+    params = {"$filter": flt, "$top": str(top)}
     return await _try_paths("GET", _ODATA_CONTACT_COLLECTIONS, token, params=params)
 
-# ── Legacy wide search kept for compatibility
+# ── Legacy wide search (compat)
 
 async def search_contact_by_phone_wide(token: str, phone_raw: str) -> Dict[str, Any]:
     digits = digits_only(phone_raw) or ""
     if not digits:
         return {"status": 400, "error": "no_digits"}
     fields = await probe_odata_phone_fields(token)
-    if not fields:
-        return {"status": 404, "error": "no_valid_phone_fields"}
     return await odata_contacts_filter_by_digits(token, digits, fields, top=1)
 
-# ── Two-stage: OData probe → candidate keys → verify with CRM
+# ── Two-stage: OData → verify via CRM
 
 async def search_contact_keys_by_phone_two_stage(token: str, phone_raw: str) -> Dict[str, Any]:
     digits = digits_only(phone_raw) or ""
