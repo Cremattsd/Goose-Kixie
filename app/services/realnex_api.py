@@ -1,3 +1,4 @@
+# app/services/realnex_api.py
 import os, re, base64, asyncio, httpx, json
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, unquote
@@ -237,7 +238,10 @@ async def search_contact_keys_by_phone_two_stage(token: str, phone_raw: str) -> 
     digits = digits_only(phone_raw) or ""
     if not digits:
         return {"status": 400, "error": "no_digits"}
+    # Probe fields; if empty, fall back to static list so we still search.
     fields = await probe_odata_phone_fields(token)
+    if not fields:
+        fields = list(_STATIC_PHONE_FIELDS)
     wide = await odata_contacts_filter_by_digits(token, digits, fields, top=10)
     if int(wide.get("status", 0)) // 100 != 2:
         return {"status": 404, "error": "odata_no_match", "probe_fields": fields, "wide": wide}
