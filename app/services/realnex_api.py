@@ -33,7 +33,6 @@ async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
         data = resp.json() if resp.content else {}
     except Exception:
         data = {"raw": (await resp.aread()).decode("utf-8", "ignore")}
-    # Always return a dict so callers can safely resp.get(...)
     if not isinstance(data, dict):
         data = {"data": data}
     data.setdefault("status", resp.status_code)
@@ -148,12 +147,11 @@ async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
 
 # ─────────────────── OData: Contacts (probe fields, then filter) ───────────────────
 
-# Keep collection relative to avoid /CrmOData/CrmOData/Contacts duplication.
 _ODATA_CONTACT_COLLECTIONS = ["Contacts"]
 
 _STATIC_PHONE_FIELDS = [
     "PrimaryPhone","MobilePhone","BusinessPhone","HomePhone","WorkPhone",
-    "CellPhone","Phone","Phone1","Phone2","Phone3","OtherPhone","AssistantPhone","Fax"
+    "CellPhone","Phone","Phone1","Phone2","Phone3","OtherPhone","AssistantPhone","Fax","Mobile"
 ]
 
 def _like_phone_name(name: str) -> bool:
@@ -183,8 +181,33 @@ async def _odata_field_is_selectable(token: str, field: str) -> bool:
                     pass
     return False
 
+async def _odata_field_supports_contains(token: str, field: str) -> Tuple[bool, bool]:
+    """
+    Returns (works_without_cast, works_with_cast). Tries a tiny filter that should parse.
+    """
+    test_digit = "0"
+    async with _client() as client:
+        for base in BASES:
+            for coll in _ODATA_CONTACT_COLLECTIONS:
+                # 1) raw contains
+                url1 = f"{base.rstrip('/')}/{coll}?$filter=contains({field},'{test_digit}')&$top=0"
+                try:
+                    r1 = await _send(client, "GET", url1, token)
+                    if r1.status_code < 400:
+                        return True, False
+                except httpx.HTTPError:
+                    pass
+                # 2) cast to string
+                url2 = f"{base.rstrip('/')}/{coll}?$filter=contains(cast({field},'Edm.String'),'{test_digit}')&$top=0"
+                try:
+                    r2 = await _send(client, "GET", url2, token)
+                    if r2.status_code < 400:
+                        return False, True
+                except httpx.HTTPError:
+                    pass
+    return False, False
+
 async def _odata_guess_phone_fields_from_sample(token: str) -> List[str]:
-    """Grab a sample row and infer phone-ish property names that actually exist on the OData entity."""
     async with _client() as client:
         for base in BASES:
             for coll in _ODATA_CONTACT_COLLECTIONS:
@@ -199,7 +222,6 @@ async def _odata_guess_phone_fields_from_sample(token: str) -> List[str]:
                         first = values[0]
                         if isinstance(first, dict):
                             keys = [k for k in first.keys() if isinstance(k, str) and _like_phone_name(k)]
-                            # Validate via $select to be safe
                             valid: List[str] = []
                             for k in keys:
                                 if await _odata_field_is_selectable(token, k):
@@ -210,8 +232,6 @@ async def _odata_guess_phone_fields_from_sample(token: str) -> List[str]:
     return []
 
 async def probe_odata_phone_fields(token: str) -> List[str]:
-    """Prefer CRM defs; if empty, infer from OData sample; validate via $select."""
-    # 1) CRM definitions
     defs = await get_table_definition(token, "Contacts")
     items = defs.get("data") or defs.get("fields") or defs.get("value") or defs
     candidates: List[str] = []
@@ -224,50 +244,43 @@ async def probe_odata_phone_fields(token: str) -> List[str]:
     for f in candidates:
         if await _odata_field_is_selectable(token, f):
             validated.append(f)
-    # 2) If none validated, infer from sample entity
     if not validated:
         inferred = await _odata_guess_phone_fields_from_sample(token)
         validated.extend([x for x in inferred if x not in validated])
-    # 3) Opportunistic adds if actually selectable
-    for f in ["PrimaryPhone", "MobilePhone"]:
+    for f in ["PrimaryPhone", "MobilePhone", "Mobile", "Fax"]:
         if f not in validated and await _odata_field_is_selectable(token, f):
             validated.append(f)
     return validated
 
-def _build_candidate_filters(digits: str, fields: List[str]) -> List[str]:
-    """Return a list of $filter strings to try in order."""
-    filters: List[str] = []
-    if fields:
-        props = " or ".join([f"contains({f},'{digits}')" for f in fields])
-        filters.append(props)
-    # Common nav collections candidates (will be skipped if not supported by the model)
-    nav_candidates = [
-        "Phones/any(p: contains(p/Number,'{d}'))",
-        "PhoneNumbers/any(p: contains(p/Number,'{d}'))",
-        "ContactPhones/any(p: contains(p/Number,'{d}'))",
-        "Phones/any(p: contains(p/Phone,'{d}'))",
-        "Phones/any(p: contains(p/PhoneNumber,'{d}'))",
-    ]
-    for t in nav_candidates:
-        filters.append(t.format(d=digits))
-    return filters
-
-async def _odata_try_filters(token: str, filters: List[str], top: int) -> Dict[str, Any]:
-    """Try each filter until one yields <400."""
-    last = None
-    for flt in filters:
-        params = {"$filter": flt, "$top": str(top)}
-        resp = await _try_paths("GET", _ODATA_CONTACT_COLLECTIONS, token, params=params)
-        last = resp
-        if int(resp.get("status", 0)) < 400:
-            return resp
-    return last or {"status": 404, "error": "odata_filters_failed"}
+def _build_candidate_filters(digits: str, fields: List[str], cast_map: Dict[str, bool]) -> List[str]:
+    """
+    Build $filter candidates with per-field cast if needed.
+    cast_map[field] == True → use cast(field,'Edm.String')
+    """
+    parts: List[str] = []
+    for f in fields:
+        if cast_map.get(f):
+            parts.append(f"contains(cast({f},'Edm.String'),'{digits}')")
+        else:
+            parts.append(f"contains({f},'{digits}')")
+    return [" or ".join(parts)] if parts else []
 
 async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
-    cands = _build_candidate_filters(digits, fields)
-    if not cands:
+    if not fields:
         return {"status": 404, "error": "no_valid_phone_fields"}
-    return await _odata_try_filters(token, cands, top)
+    # Preflight each field to see whether contains() parses, with or without cast
+    cast_map: Dict[str, bool] = {}
+    usable: List[str] = []
+    for f in fields:
+        raw_ok, cast_ok = await _odata_field_supports_contains(token, f)
+        if raw_ok or cast_ok:
+            usable.append(f)
+            cast_map[f] = cast_ok and not raw_ok
+    if not usable:
+        return {"status": 404, "error": "no_filterable_phone_fields", "fields_tried": fields}
+    filters = _build_candidate_filters(digits, usable, cast_map)
+    params = {"$filter": filters[0], "$top": str(top)}
+    return await _try_paths("GET", _ODATA_CONTACT_COLLECTIONS, token, params=params)
 
 # ── Legacy wide search kept for compatibility
 
@@ -277,8 +290,7 @@ async def search_contact_by_phone_wide(token: str, phone_raw: str) -> Dict[str, 
         return {"status": 400, "error": "no_digits"}
     fields = await probe_odata_phone_fields(token)
     if not fields:
-        # Still try nav-based filters even if no fields
-        return await odata_contacts_filter_by_digits(token, digits, [], top=1)
+        return {"status": 404, "error": "no_valid_phone_fields"}
     return await odata_contacts_filter_by_digits(token, digits, fields, top=1)
 
 # ── Two-stage: OData probe → candidate keys → verify with CRM
@@ -304,7 +316,7 @@ async def search_contact_keys_by_phone_two_stage(token: str, phone_raw: str) -> 
 
     def _has_digits(d: Dict[str, Any], digits: str) -> bool:
         for n, val in d.items():
-            if "phone" in n.lower() or n.lower() in {"fax"}:
+            if "phone" in n.lower() or n.lower() in {"fax","mobile"}:
                 s = str(val or "")
                 if digits in re.sub(r"\D+", "", s):
                     return True
