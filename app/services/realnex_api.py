@@ -1,6 +1,6 @@
 # app/services/realnex_api.py
 import os, re, base64, asyncio, httpx, json
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Set
 from urllib.parse import urlparse, unquote
 
 # ─────────────── Token & Bases ───────────────
@@ -21,7 +21,7 @@ def _bases_from_env() -> List[str]:
     return parts
 
 BASES = _bases_from_env()
-_ODATA_CONTACT_COLLECTIONS = ["Contacts"]  # relative to *OData* bases
+_ODATA_CONTACT_COLLECTIONS = ["Contacts"]  # relative to *OData* bases only
 _ODATA_DEFAULT_PARAMS = {"api-version": "1.0"}  # required on this tenant
 
 def _headers(token: str) -> Dict[str, str]:
@@ -73,7 +73,7 @@ async def _try_paths(method: str, paths: List[str], token: str, **kw) -> Dict[st
                     return {"status": 599, "error": str(e), "attempted": url}
         return await _format_resp(last) if last else {"status": 404, "error": "Not Found"}
 
-# ─────────────── Phone utils ───────────────
+# ─────────────── Phone & DNC utils ───────────────
 
 def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
     if not raw:
@@ -94,6 +94,48 @@ def digits_only(raw: Optional[str]) -> Optional[str]:
         return None
     d = re.sub(r"\D+", "", raw)
     return d or None
+
+def _like_phone_name(name: str) -> bool:
+    n = name.lower()
+    return any(kw in n for kw in ["phone","mobile","cell","workphone","homephone","assistant","fax","telephone","tel"])
+
+def _is_dnc_field(name: str) -> bool:
+    n = name.lower()
+    return ("donot" in n or n.startswith("no") or "dnc" in n) and any(k in n for k in ["call","phone","fax","text","sms"])
+
+def _is_fax_field(name: str) -> bool:
+    return "fax" in (name or "").lower()
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool): return v
+    if isinstance(v, (int, float)): return v != 0
+    if isinstance(v, str): return v.strip().lower() in {"1","true","yes","y","t"}
+    return False
+
+def _row_matched_fields(row: Dict[str, Any], digits: str, fields: List[str]) -> Set[str]:
+    hits: Set[str] = set()
+    for f in fields:
+        if f in row and row[f] is not None:
+            val = re.sub(r"\D+", "", str(row[f]))
+            if digits and digits in val:
+                hits.add(f)
+    return hits
+
+def _passes_dnc(row: Dict[str, Any], matched_fields: Set[str], dnc_fields: Dict[str, List[str]], exclude_fax: bool) -> bool:
+    # Global do-not-call?
+    for f in dnc_fields.get("call", []):
+        if f in row and _truthy(row[f]):
+            return False
+    # Fax handling
+    if matched_fields:
+        only_fax = all(_is_fax_field(f) for f in matched_fields)
+        if only_fax and exclude_fax:
+            return False
+        if any(_is_fax_field(f) for f in matched_fields):
+            for f in dnc_fields.get("fax", []):
+                if f in row and _truthy(row[f]):
+                    return False
+    return True
 
 # ─────────────── CRM: Contacts & History ───────────────
 
@@ -147,32 +189,21 @@ async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
         tzs = set()
     return tz in tzs if tzs else True
 
-# ─────────────── OData helpers ───────────────
-
-def _like_phone_name(name: str) -> bool:
-    n = name.lower()
-    return any(kw in n for kw in ["phone","mobile","cell","workphone","homephone","assistant","fax","telephone","tel"])
-
-def _safe_field_name(x: Any) -> Optional[str]:
-    if isinstance(x, dict):
-        for k in ("Name","name","Field","field","ApiName","apiName"):
-            v = x.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    if isinstance(x, str) and x.strip():
-        return x.strip()
-    return None
+# ─────────────── OData: field probes (Contacts) ───────────────
 
 async def _odata_field_is_selectable(token: str, field: str) -> bool:
     async with _client() as client:
         for base in BASES:
-            # use only OData bases
+            # only OData bases
             if not base.lower().endswith(("crmodata","odata")):
                 continue
             for coll in _ODATA_CONTACT_COLLECTIONS:
                 url = f"{base.rstrip('/')}/{coll}"
                 try:
-                    r = await _send(client, "GET", url, token, params=_merge_params({"$select": field, "$top": "1"}, _ODATA_DEFAULT_PARAMS))
+                    r = await _send(
+                        client, "GET", url, token,
+                        params=_merge_params({"$select": field, "$top": "1"}, _ODATA_DEFAULT_PARAMS),
+                    )
                     if r.status_code < 400:
                         return True
                 except httpx.HTTPError:
@@ -196,6 +227,9 @@ async def _odata_guess_phone_fields_from_sample(token: str) -> List[str]:
                         keys = [k for k in values[0].keys() if isinstance(k, str) and _like_phone_name(k)]
                         valid = []
                         for k in keys:
+                            # exclude DNC-looking fields from phone list
+                            if _is_dnc_field(k):
+                                continue
                             if await _odata_field_is_selectable(token, k):
                                 valid.append(k)
                         return valid
@@ -209,11 +243,19 @@ async def probe_odata_phone_fields(token: str) -> List[str]:
     candidates: List[str] = []
     if isinstance(items, list):
         for it in items:
-            name = _safe_field_name(it)
-            if name and _like_phone_name(name):
+            name = None
+            if isinstance(it, dict):
+                for k in ("Name","name","Field","field","ApiName","apiName"):
+                    v = it.get(k)
+                    if isinstance(v, str) and v.strip():
+                        name = v.strip()
+                        break
+            elif isinstance(it, str) and it.strip():
+                name = it.strip()
+            if name and _like_phone_name(name) and not _is_dnc_field(name):
                 candidates.append(name)
-    # seeds observed on ContactListItem for your tenant
-    for s in ["Mobile","Fax","DoNotFax","Phone","Phone1","Phone2","Phone3","AssistantPhone","HomePhone","WorkPhone"]:
+    # seeds *without* DNC booleans
+    for s in ["Mobile","Fax","Phone","Phone1","Phone2","Phone3","AssistantPhone","HomePhone","WorkPhone"]:
         if s not in candidates:
             candidates.append(s)
     # validate via $select
@@ -228,6 +270,35 @@ async def probe_odata_phone_fields(token: str) -> List[str]:
                 validated.append(x)
     return validated
 
+# DNC seeds and probe
+_DNC_SEEDS = {
+    "call": ["DoNotCall","Dnc","DNC","DoNotPhone","NoCall","NoPhone","DoNotContactPhone"],
+    "fax":  ["DoNotFax","NoFax"],
+    "text": ["DoNotText","DoNotSMS","NoSMS","NoText"],
+}
+
+async def probe_odata_dnc_fields(token: str) -> Dict[str, List[str]]:
+    out = {"call": [], "fax": [], "text": []}
+    for kind, names in _DNC_SEEDS.items():
+        for f in names:
+            if await _odata_field_is_selectable(token, f):
+                out[kind].append(f)
+    # best-effort inference if nothing validated
+    if not any(out.values()):
+        guessed = await _odata_guess_phone_fields_from_sample(token)  # reuses sample keys
+        for k in guessed:
+            lk = k.lower()
+            if "donot" in lk or "dnc" in lk or lk.startswith("no"):
+                if "fax" in lk:
+                    out["fax"].append(k)
+                elif "text" in lk or "sms" in lk:
+                    out["text"].append(k)
+                else:
+                    out["call"].append(k)
+    return out
+
+# ─────────────── OData: contains() + scan (Contacts) ───────────────
+
 async def _odata_field_supports_contains(token: str, field: str) -> Tuple[bool, bool]:
     """
     Returns (works_without_cast, works_with_cast).
@@ -239,23 +310,28 @@ async def _odata_field_supports_contains(token: str, field: str) -> Tuple[bool, 
             path = f"{base.rstrip('/')}/Contacts"
             # 1) raw contains
             try:
-                r1 = await _send(client, "GET", path, token,
-                                 params=_merge_params({"$filter": f"contains({field},'0')", "$top": "0"}, _ODATA_DEFAULT_PARAMS))
+                r1 = await _send(
+                    client, "GET", path, token,
+                    params=_merge_params({"$filter": f"contains({field},'0')", "$top": "0"}, _ODATA_DEFAULT_PARAMS),
+                )
                 if r1.status_code < 400:
                     return True, False
             except httpx.HTTPError:
                 pass
             # 2) cast to string
             try:
-                r2 = await _send(client, "GET", path, token,
-                                 params=_merge_params({"$filter": f"contains(cast({field},'Edm.String'),'0')", "$top": "0"}, _ODATA_DEFAULT_PARAMS))
+                r2 = await _send(
+                    client, "GET", path, token,
+                    params=_merge_params({"$filter": f"contains(cast({field},'Edm.String'),'0')", "$top": "0"}, _ODATA_DEFAULT_PARAMS),
+                )
                 if r2.status_code < 400:
                     return False, True
             except httpx.HTTPError:
                 pass
     return False, False
 
-async def _odata_try_contains(token: str, digits: str, fields: List[str], top: int) -> Dict[str, Any]:
+async def _odata_try_contains(token: str, digits: str, fields: List[str], dnc_fields: Dict[str, List[str]], top: int, exclude_fax: bool) -> Dict[str, Any]:
+    # build usable fields (supports contains and/or cast)
     usable: List[str] = []
     cast_map: Dict[str, bool] = {}
     for f in fields:
@@ -265,6 +341,7 @@ async def _odata_try_contains(token: str, digits: str, fields: List[str], top: i
             cast_map[f] = cast_ok and not raw_ok
     if not usable:
         return {"status": 404, "error": "no_filterable_phone_fields", "fields_tried": fields}
+
     parts = []
     for f in usable:
         if cast_map.get(f):
@@ -272,16 +349,46 @@ async def _odata_try_contains(token: str, digits: str, fields: List[str], top: i
         else:
             parts.append(f"contains({f},'{digits}')")
     flt = " or ".join(parts)
-    return await _try_paths(
-        "GET",
-        _ODATA_CONTACT_COLLECTIONS,
-        token,
-        params=_merge_params({"$filter": flt, "$top": str(top)}, _ODATA_DEFAULT_PARAMS),
-    )
 
-async def _odata_scan_pages(token: str, digits: str, fields: List[str], page_top: int = 100, max_pages: int = 10) -> Dict[str, Any]:
+    async with _client() as client:
+        for base in BASES:
+            if not base.lower().endswith(("crmodata","odata")):
+                continue
+            for coll in _ODATA_CONTACT_COLLECTIONS:
+                url = f"{base.rstrip('/')}/{coll}"
+                try:
+                    r = await _send(
+                        client, "GET", url, token,
+                        params=_merge_params({"$filter": flt, "$top": str(top)}, _ODATA_DEFAULT_PARAMS),
+                    )
+                    payload = await _format_resp(r)
+                    if r.status_code >= 400:
+                        return payload
+                    rows = payload.get("value") or payload.get("data") or []
+                    if not isinstance(rows, list) or not rows:
+                        return {"status": 204, "value": [], "method": "filter", "url": payload.get("url")}
+                    # DNC filter + fax handling
+                    kept: List[Dict[str, Any]] = []
+                    filtered = 0
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        hits = _row_matched_fields(row, digits, usable)
+                        if not _passes_dnc(row, hits, dnc_fields, exclude_fax):
+                            filtered += 1
+                            continue
+                        kept.append(row)
+                    if kept:
+                        return {"status": 200, "value": kept, "method": "filter", "filtered_out": filtered, "url": payload.get("url")}
+                    return {"status": 404, "error": "filtered_all_by_dnc_or_fax", "filtered_out": filtered, "method": "filter"}
+                except httpx.HTTPError as e:
+                    return {"status": 599, "error": str(e)}
+    return {"status": 404, "error": "no_odata_base"}
+
+async def _odata_scan_pages(token: str, digits: str, fields: List[str], dnc_fields: Dict[str, List[str]], page_top: int = 100, max_pages: int = 10, exclude_fax: bool = True) -> Dict[str, Any]:
     """
     Tenant-safe fallback when $filter is too limited: scan pages and match digits client-side.
+    DNC-aware and fax-skipping.
     """
     async with _client() as client:
         for base in BASES:
@@ -303,11 +410,13 @@ async def _odata_scan_pages(token: str, digits: str, fields: List[str], page_top
                         for row in rows:
                             if not isinstance(row, dict):
                                 continue
-                            for f in fields:
-                                if f in row and row[f] is not None:
-                                    if digits in (re.sub(r"\D+", "", str(row[f])) or ""):
-                                        # Found a candidate; return like a normal OData list
-                                        return {"status": 200, "value": [row], "method": "scan", "url": payload.get("url")}
+                            hits = _row_matched_fields(row, digits, fields)
+                            if not hits:
+                                continue
+                            if not _passes_dnc(row, hits, dnc_fields, exclude_fax):
+                                continue
+                            # Found a viable row
+                            return {"status": 200, "value": [row], "method": "scan", "url": payload.get("url")}
                         if len(rows) < page_top:
                             break
                         skip += page_top
@@ -316,23 +425,24 @@ async def _odata_scan_pages(token: str, digits: str, fields: List[str], page_top
     return {"status": 404, "error": "scan_no_match"}
 
 async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
-    # 1) Try server-side contains() (with per-field cast when needed)
-    tried = await _odata_try_contains(token, digits, fields, top)
+    # Probe DNC flags once
+    dnc_fields = await probe_odata_dnc_fields(token)
+    # 1) Try server-side contains() (with per-field cast if needed) with DNC filtering
+    tried = await _odata_try_contains(token, digits, fields, dnc_fields, top, exclude_fax=True)
     if int(tried.get("status", 0)) // 100 == 2:
         vals = tried.get("value") or tried.get("data") or []
         if isinstance(vals, list) and vals:
-            tried["method"] = "filter"
             return tried
-        # 2) No rows? fall back to scan
-        scanned = await _odata_scan_pages(token, digits, fields, page_top=100, max_pages=10)
+        # 2) No rows or filtered out? fall back to scan
+        scanned = await _odata_scan_pages(token, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
         if int(scanned.get("status", 0)) // 100 == 2:
             return scanned
-        return {"status": 404, "error": "odata_empty", "tried": tried, "scan": scanned}
+        return {"status": 404, "error": "odata_empty_or_filtered_by_dnc", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
     # 3) Filter parse failed; try scan outright
-    scanned = await _odata_scan_pages(token, digits, fields, page_top=100, max_pages=10)
+    scanned = await _odata_scan_pages(token, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
     if int(scanned.get("status", 0)) // 100 == 2:
         return scanned
-    return {"status": tried.get("status", 400), "error": "odata_no_match", "tried": tried, "scan": scanned}
+    return {"status": tried.get("status", 400), "error": "odata_no_match", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
 
 # ─────────────── Public search helpers ───────────────
 
