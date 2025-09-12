@@ -1,4 +1,3 @@
-# app/services/realnex_api.py
 import os, re, base64, asyncio, httpx, json
 from typing import Any, Dict, Optional, List, Tuple
 from urllib.parse import urlparse, unquote
@@ -33,10 +32,12 @@ async def _format_resp(resp: httpx.Response) -> Dict[str, Any]:
         data = resp.json() if resp.content else {}
     except Exception:
         data = {"raw": (await resp.aread()).decode("utf-8", "ignore")}
-    if isinstance(data, dict):
-        data.setdefault("status", resp.status_code)
-        data.setdefault("url", str(resp.request.url))
-        data.setdefault("method", resp.request.method)
+    # Always return a dict so callers can safely resp.get(...)
+    if not isinstance(data, dict):
+        data = {"data": data}
+    data.setdefault("status", resp.status_code)
+    data.setdefault("url", str(resp.request.url))
+    data.setdefault("method", resp.request.method)
     return data
 
 async def _send(client: httpx.AsyncClient, method: str, url: str, token: str, **kw) -> httpx.Response:
@@ -148,12 +149,10 @@ async def is_valid_timezone(token: str, tz: Optional[str]) -> bool:
 
 # ─────────────────── OData: Contacts (probe fields, then filter) ───────────────────
 
-_ODATA_CONTACT_COLLECTIONS = [
-    "CrmOData/Contacts",
-    "crmodata/Contacts",
-    "OData/Contacts",
-    "odata/Contacts",
-]
+# IMPORTANT: BASES already includes variants like /CrmOData, /crmodata, /odata.
+# Keep collection relative to avoid /CrmOData/CrmOData/Contacts duplication.
+_ODATA_CONTACT_COLLECTIONS = ["Contacts"]
+
 # static list used as a last-ditch fallback for legacy callers
 _STATIC_PHONE_FIELDS = [
     "PrimaryPhone","MobilePhone","BusinessPhone","HomePhone","WorkPhone",
@@ -416,7 +415,8 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
             for path in shapes:
                 url = f"{base.rstrip('/')}/{path.lstrip('/')}"
                 try:
-                    r = await _send(client, "OPTIONS", url, get_rn_token())
+                    # Use the token passed into the function (don’t ignore it)
+                    r = await _send(client, "OPTIONS", url, token)
                     out["checks"].append({"url": url, "status": r.status_code})
                 except Exception as e:
                     out["checks"].append({"url": url, "error": str(e)})
