@@ -137,7 +137,7 @@ def _passes_dnc(row: Dict[str, Any], matched_fields: Set[str], dnc_fields: Dict[
                     return False
     return True
 
-# ─────────────── CRM: Contacts & History ───────────────
+# ─────────────── CRM: Contacts, History, Tasks ───────────────
 
 async def search_by_phone(token: str, phone_e164: str) -> Dict[str, Any]:
     resp = await _try_paths(
@@ -155,6 +155,18 @@ async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 async def create_history(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return await _try_paths("POST", ["history", "History", "histories", "Histories"], token, json=payload)
+
+async def create_task(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a Task in RealNex.
+    Common fields: subject, notes, dueDate (ISO), contactKey, userKey?, teamKey?
+    """
+    return await _try_paths(
+        "POST",
+        ["task", "Task", "tasks", "Tasks", "CRM/task", "CRM/Task"],
+        token,
+        json=payload,
+    )
 
 async def get_contact(token: str, contact_key: str) -> Dict[str, Any]:
     k = contact_key
@@ -424,25 +436,73 @@ async def _odata_scan_pages(token: str, digits: str, fields: List[str], dnc_fiel
                         break
     return {"status": 404, "error": "scan_no_match"}
 
-async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
-    # Probe DNC flags once
-    dnc_fields = await probe_odata_dnc_fields(token)
-    # 1) Try server-side contains() (with per-field cast if needed) with DNC filtering
-    tried = await _odata_try_contains(token, digits, fields, dnc_fields, top, exclude_fax=True)
-    if int(tried.get("status", 0)) // 100 == 2:
-        vals = tried.get("value") or tried.get("data") or []
-        if isinstance(vals, list) and vals:
-            return tried
-        # 2) No rows or filtered out? fall back to scan
-        scanned = await _odata_scan_pages(token, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
-        if int(scanned.get("status", 0)) // 100 == 2:
-            return scanned
-        return {"status": 404, "error": "odata_empty_or_filtered_by_dnc", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
-    # 3) Filter parse failed; try scan outright
-    scanned = await _odata_scan_pages(token, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
-    if int(scanned.get("status", 0)) // 100 == 2:
-        return scanned
-    return {"status": tried.get("status", 400), "error": "odata_no_match", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
+# ─────────────── OData: iteration (Contacts) ───────────────
+
+async def odata_contacts_iter(
+    token: str,
+    select: Optional[str] = None,
+    filter: Optional[str] = None,
+    top: int = 200,
+    max_rows: int = 1000,
+):
+    """
+    Async generator yielding lists of contact rows from the first available OData base.
+
+    Example:
+        async for page in odata_contacts_iter(token, select="Key,FirstName,LastName,Mobile", filter="DoNotCall eq false"):
+            for row in page:
+                ...
+
+    Notes:
+      - Honors api-version for tenants that require it (via _ODATA_DEFAULT_PARAMS).
+      - Stops at max_rows (even if the last page is truncated).
+    """
+    # find an OData-capable base
+    odata_base = None
+    for b in BASES:
+        if b.lower().endswith(("crmodata", "odata")):
+            odata_base = b.rstrip("/")
+            break
+    if not odata_base:
+        raise RuntimeError("No OData base configured/available for Contacts")
+
+    coll = _ODATA_CONTACT_COLLECTIONS[0]
+    yielded = 0
+    skip = 0
+
+    async with _client() as client:
+        while yielded < max_rows:
+            params = {"$top": str(top), "$skip": str(skip)}
+            if select:
+                params["$select"] = select
+            if filter:
+                params["$filter"] = filter
+            params = _merge_params(params, _ODATA_DEFAULT_PARAMS)
+
+            url = f"{odata_base}/{coll}"
+            try:
+                r = await _send(client, "GET", url, token, params=params)
+            except httpx.HTTPError as e:
+                raise RuntimeError(f"OData request failed: {e}") from e
+
+            payload = await _format_resp(r)
+            if r.status_code >= 400:
+                raise RuntimeError(f"OData {r.status_code}: {payload.get('raw') or payload}")
+
+            rows = payload.get("value") or payload.get("data") or []
+            if not isinstance(rows, list) or not rows:
+                break
+
+            remaining = max_rows - yielded
+            if len(rows) > remaining:
+                rows = rows[:remaining]
+
+            yield rows
+            yielded += len(rows)
+
+            if len(rows) < top:
+                break
+            skip += top
 
 # ─────────────── Public search helpers ───────────────
 
