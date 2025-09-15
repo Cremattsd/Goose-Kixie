@@ -1,18 +1,25 @@
 # app/routes/dialer.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, HTTPException, Query, Header
-import os, hmac, hashlib
+import os, hmac, hashlib, json
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any
 
+from fastapi import APIRouter, Request, HTTPException, Query, Header, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
 from ..schemas.kixie import KixieWebhook, SimpleContact
+from ..services.db import get_db
+from ..models.call_state import CallState
 from ..services.realnex_api import (
     normalize_phone_e164ish,
     digits_only,
     search_by_phone,                          # CRM-native search (if tenant supports)
     create_contact,
     create_history,
+    create_task,                               # ← added for optional auto-tasks
     get_rn_token,
     search_contact_keys_by_phone_two_stage,   # OData probe + CRM verify
     attach_recording_from_url,
@@ -95,6 +102,97 @@ async def _find_existing_contact_key(token: str, number_raw: Optional[str]) -> O
 
     return None
 
+def _auto_task_enabled() -> bool:
+    return str(os.getenv("RN_TASKS_ENABLED", "0")).strip().lower() in ("1","true","yes","on")
+
+def _parse_task_rules() -> Dict[str, Any]:
+    """
+    RN_TASK_RULES JSON, e.g.:
+    {"Left VM":{"due_in_days":2,"subject":"Call back","note":"LM on {{start}}"},
+     "Connected":{"due_in_days":1,"subject":"Send recap","note":"Email recap"}}
+    """
+    raw = os.getenv("RN_TASK_RULES", "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+def _render_note(tmpl: str, payload: KixieWebhook, contact_key: str) -> str:
+    repl = {
+        "{{direction}}": payload.direction or "",
+        "{{disposition}}": payload.disposition or "",
+        "{{duration}}": str(payload.duration_sec or 0),
+        "{{from}}": payload.from_number or "",
+        "{{to}}": payload.to_number or "",
+        "{{callId}}": payload.call_id or "",
+        "{{agentEmail}}": payload.agent_email or "",
+        "{{recordingUrl}}": payload.recording_url or "",
+        "{{start}}": (payload.start_utc_ms() or ""),
+        "{{end}}": (payload.end_utc_ms() or ""),
+        "{{contactKey}}": contact_key or "",
+    }
+    out = tmpl or ""
+    for k, v in repl.items():
+        out = out.replace(k, v)
+    return out
+
+# ───────────────────────── Live call UX (DB-backed) ─────────────────────────
+
+class StartTimerIn(BaseModel):
+    call_id: str = Field(..., min_length=2, max_length=64)
+    agent_email: Optional[str] = None
+    phone: Optional[str] = None
+    started_at: Optional[datetime] = Field(None, description="If omitted, server now (UTC)")
+
+@router.post("/calls/timer/start", summary="Start/overwrite a call timer and persist call state")
+def start_timer(body: StartTimerIn, db: Session = Depends(get_db)):
+    started = body.started_at or datetime.now(timezone.utc)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    phone_e164 = normalize_phone_e164ish(body.phone) if body.phone else None
+
+    row = db.query(CallState).filter(CallState.call_id == body.call_id).first() or CallState(call_id=body.call_id)
+    row.agent_email = body.agent_email or row.agent_email
+    row.phone_e164  = phone_e164 or row.phone_e164
+    row.started_at  = started
+    row.updated_at  = datetime.now(timezone.utc)
+    db.add(row); db.commit()
+    return {"ok": True, "call_id": body.call_id, "started_at": row.started_at.isoformat()}
+
+class NoteIn(BaseModel):
+    call_id: str
+    note: str = Field(..., min_length=1, max_length=2000)
+
+@router.post("/calls/note", summary="Upsert agent live note")
+def set_note(body: NoteIn, db: Session = Depends(get_db)):
+    row = db.query(CallState).filter(CallState.call_id == body.call_id).first() or CallState(call_id=body.call_id)
+    row.note = body.note.strip()
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(row); db.commit()
+    return {"ok": True, "call_id": body.call_id, "note_len": len(row.note or "")}
+
+class DispoIn(BaseModel):
+    call_id: str
+    result: str = Field(..., min_length=1, max_length=120)
+
+@router.post("/calls/dispo", summary="Upsert disposition")
+def set_dispo(body: DispoIn, db: Session = Depends(get_db)):
+    row = db.query(CallState).filter(CallState.call_id == body.call_id).first() or CallState(call_id=body.call_id)
+    row.disposition = body.result.strip()
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(row); db.commit()
+    return {"ok": True, "call_id": body.call_id, "disposition": row.disposition}
+
+@router.get("/calls/{call_id}/timer", summary="Elapsed seconds for a call (server clock)")
+def get_timer(call_id: str, db: Session = Depends(get_db)):
+    row = db.query(CallState).filter(CallState.call_id == call_id).first()
+    if not row or not row.started_at:
+        return {"ok": False, "error": "no_timer"}
+    elapsed = max(0, int((datetime.now(timezone.utc) - row.started_at).total_seconds()))
+    return {"ok": True, "call_id": call_id, "elapsed_seconds": elapsed}
+
 # ───────────────────────── Routes ─────────────────────────────
 
 @router.get("/contacts/search")
@@ -159,10 +257,11 @@ async def contacts_search(phone: str = Query(..., description="Phone number to s
 async def kixie_webhook(
     payload: KixieWebhook,
     request: Request,
+    db: Session = Depends(get_db),
     x_user_tz: Optional[str] = Header(None, convert_underscores=False),  # pass IANA tz like "America/Chicago"
 ):
     """
-    Receives Kixie webhook, finds an existing contact by phone, and logs a History
+    Receives Kixie webhook, merges live state, finds existing contact by phone, and logs a History
     linked to that contact. We do NOT create contacts. If no match → 202 skipped.
     """
     raw = await request.body()
@@ -184,12 +283,28 @@ async def kixie_webhook(
         except Exception:
             tz_assume = None
 
+    # Merge in live call state (note/dispo/agent) if present
+    if payload.call_id:
+        row = db.query(CallState).filter(CallState.call_id == payload.call_id).first()
+        if row:
+            if not payload.disposition and row.disposition:
+                payload.disposition = row.disposition
+            if not (payload.agent_notes or "").strip() and (row.note or "").strip():
+                payload.agent_notes = row.note
+            if not payload.agent_email and row.agent_email:
+                payload.agent_email = row.agent_email
+
     # Which number represents the customer we are logging against?
     target_number = payload.to_number if (payload.direction or "outbound") == "outbound" else payload.from_number
 
     # Find existing contact (no auto-creates)
     contact_key = await _find_existing_contact_key(token, target_number)
     if not contact_key:
+        # cleanup ephemeral state if we have it
+        if payload.call_id:
+            row = db.query(CallState).filter(CallState.call_id == payload.call_id).first()
+            if row:
+                db.delete(row); db.commit()
         return {
             "status": 202,
             "skipped": True,
@@ -243,6 +358,32 @@ async def kixie_webhook(
     # Optional: attach recording to the CONTACT (not the history)
     if os.getenv("ATTACH_RECORDING_TO_CONTACT", "0") == "1" and payload.recording_url:
         out["attachment"] = await attach_recording_from_url(token, contact_key, payload.recording_url)
+
+    # Optional: create follow-up Task from disposition rules
+    if _auto_task_enabled():
+        rules = _parse_task_rules()
+        rule = rules.get((payload.disposition or "").strip())
+        if rule:
+            base_dt = payload.ended_at or payload.started_at or datetime.now(timezone.utc)
+            if base_dt.tzinfo is None:
+                base_dt = base_dt.replace(tzinfo=timezone.utc)
+            due_dt = base_dt + timedelta(days=int(rule.get("due_in_days", 1)))
+            task_body = {
+                "subject": rule.get("subject") or f"Follow-up: {payload.disposition or 'Call'}",
+                "notes": _render_note(rule.get("note", "") or "", payload, contact_key),
+                "dueDate": due_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "contactKey": contact_key,
+            }
+            if os.getenv("RN_USER_KEY"): task_body["userKey"] = os.getenv("RN_USER_KEY")
+            if os.getenv("RN_TEAM_KEY"): task_body["teamKey"] = os.getenv("RN_TEAM_KEY")
+            task_resp = await create_task(token, {k: v for k, v in task_body.items() if v is not None})
+            out["task"] = {"status": task_resp.get("status"), "payload": task_body, "resp": task_resp}
+
+    # Clean up ephemeral call state
+    if payload.call_id:
+        row = db.query(CallState).filter(CallState.call_id == payload.call_id).first()
+        if row:
+            db.delete(row); db.commit()
 
     return out
 
