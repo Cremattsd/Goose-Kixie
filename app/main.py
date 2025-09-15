@@ -1,4 +1,4 @@
-# app/main.py  (ADD admin router include)
+# app/main.py  (append router include)
 from dotenv import load_dotenv; load_dotenv()
 
 import os
@@ -9,20 +9,21 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from .routes.dialer import router as dialer_router
 from .routes.debug_realnex import router as debug_router
 from .routes.powerlist import router as powerlist_router
-from .routes.admin import router as admin_router  # ← add
+from .routes.admin import router as admin_router
+from .routes.click_to_dial import router as ctd_router  # ← add
 
 from .services.db import init_db
 
 app = FastAPI(title="Goose-Kixie (RealNex)")
 
-# ── DB init on startup (dev-friendly; disable with DB_CREATE_ALL=0) ───────────
+# ── DB init on startup (dev-friendly; disable with DB_CREATE_ALL=0)
 if os.getenv("DB_CREATE_ALL", "1") not in ("0", "false", "False"):
     try:
         init_db()
     except Exception as e:
         print(f"[init_db] warning: {e}")
 
-# ── Middleware: CORS & Trusted Hosts ──────────────────────────────────────────
+# ── Middleware: CORS & Trusted Hosts
 origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +36,7 @@ app.add_middleware(
 allowed_hosts = [h.strip() for h in os.getenv("TRUSTED_HOSTS", "*").split(",") if h.strip()]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
-# ── Basic health/root ─────────────────────────────────────────────────────────
+# ── Basic health/root
 @app.get("/")
 def root():
     routes = []
@@ -50,8 +51,9 @@ def root():
 def health():
     return {"ok": True}
 
-# ── Routers ───────────────────────────────────────────────────────────────────
+# ── Routers
 app.include_router(dialer_router, tags=["dialer"])
 app.include_router(debug_router, tags=["debug"])
 app.include_router(powerlist_router, tags=["kixie"])
-app.include_router(admin_router, tags=["admin"])  # ← add
+app.include_router(admin_router, tags=["admin"])
+app.include_router(ctd_router, tags=["dialer"])  # ← add
