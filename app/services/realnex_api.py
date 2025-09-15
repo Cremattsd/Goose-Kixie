@@ -163,10 +163,17 @@ async def create_task(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     return await _try_paths(
         "POST",
-        ["task", "Task", "tasks", "Tasks", "CRM/task", "CRM/Task"],
+        [
+            "task", "Task", "tasks", "Tasks",
+            "todo", "Todo",                 # some tenants expose Todo endpoints
+            "CRM/task", "CRM/Task", "CRM/tasks", "CRM/Tasks"
+        ],
         token,
         json=payload,
     )
+
+async def list_tasks(token: str, top: int = 5) -> Dict[str, Any]:
+    return await _try_paths("GET", [f"tasks?top={top}", f"Tasks?top={top}", "CRM/Tasks"], token)
 
 async def get_contact(token: str, contact_key: str) -> Dict[str, Any]:
     k = contact_key
