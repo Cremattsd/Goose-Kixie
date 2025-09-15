@@ -5,7 +5,7 @@ import os, hmac, hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, Request, HTTPException, Query, Header, Depends
+from fastapi import APIRouter, Request, HTTPException, Query, Header, Depends, Path
 from pydantic import BaseModel, Field
 from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
@@ -320,6 +320,54 @@ def call_update(body: UpdateCallBody, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "call_id": row.call_id, "disposition": row.disposition, "note": row.note}
 
+@router.get("/dialer/call/{call_id}")
+def call_get(call_id: str = Path(..., min_length=2, max_length=64), db: Session = Depends(get_db)):
+    """
+    Fetch current call state + elapsed seconds (for a live timer UI).
+    """
+    row = db.get(CallState, call_id)
+    if not row:
+        raise HTTPException(404, "call_id not found")
+    now = datetime.now(timezone.utc)
+    started = row.started_at or now
+    elapsed = int((now - started).total_seconds()) if started.tzinfo else 0
+    return {
+        "call_id": row.call_id,
+        "agent_email": row.agent_email,
+        "phone_e164": row.phone_e164,
+        "disposition": row.disposition,
+        "note": row.note,
+        "started_at": started,
+        "updated_at": row.updated_at,
+        "elapsed_seconds": max(elapsed, 0),
+    }
+
+@router.get("/dialer/call/options")
+def call_options(auto_tasks: Optional[bool] = Query(None)):
+    """
+    Provide UI options: disposition list, auto-tasks default, env-driven bits.
+    """
+    return {
+        "auto_tasks_default": _auto_tasks_enabled(auto_tasks),
+        "auto_task_dispositions": sorted(list(_auto_task_dispo_set())),
+        "env": {
+            "attach_recording_to_contact": os.getenv("ATTACH_RECORDING_TO_CONTACT", "0") in ("1","true","yes"),
+        }
+    }
+
+@router.post("/dialer/call/cleanup")
+def call_cleanup(older_than_minutes: int = Query(120, ge=1, le=1440), db: Session = Depends(get_db)):
+    """
+    Remove stale CallState rows (housekeeping). Useful for dev/test.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+    q = db.query(CallState).filter(CallState.updated_at < cutoff)
+    n = 0
+    for row in q.all():
+        db.delete(row); n += 1
+    db.commit()
+    return {"deleted": n, "cutoff": cutoff.isoformat()}
+
 @router.post("/dialer/call/end")
 async def call_end(
     payload: KixieWebhook,
@@ -408,7 +456,6 @@ async def kixie_webhook(
         _verify_goose_shared_secret(db, request)
     except HTTPException:
         # If tenant-secret check fails but KIXIE HMAC passed (or not configured), continue.
-        # This keeps compatibility with existing Kixie-only configs.
         pass
 
     token = get_rn_token()
@@ -453,7 +500,7 @@ async def kixie_webhook(
         payload=payload,
         tz_assume=tz_assume,
         extra_note=merged_note,
-        auto_tasks=_auto_tasks_enabled(None),  # webhook uses env default unless you add qs flag at Kixie
+        auto_tasks=_auto_tasks_enabled(None),  # webhook uses env default unless Kixie can send a flag
         token=token,
         contact_key=contact_key,
     )
