@@ -1,13 +1,20 @@
-import os, secrets
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+# app/routes/install.py
+from __future__ import annotations
+
+import os, secrets, json
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+
 from ..services.db import get_db
 from ..models.tenant import Tenant
-from ..services.crypto import encrypt
-from ..services.kixie_api import create_or_update_webhook
+from ..services.crypto import encrypt, decrypt
+from ..services.kixie_api import create_or_update_webhook, list_webhooks, delete_webhook
 
 router = APIRouter()
+
+# ───────────────────────── Models ─────────────────────────
 
 class InstallBody(BaseModel):
     # Optional: fall back to .env if omitted
@@ -15,6 +22,21 @@ class InstallBody(BaseModel):
     kixie_api_key: str | None = None
     kixie_business_id: str | None = None
     realnex_jwt: str | None = None
+
+class ReinstallBody(BaseModel):
+    tenant_id: Optional[int] = Field(None, description="Defaults to most-recent active tenant")
+    events: List[str] = Field(default_factory=lambda: ["endcall","disposition","sms"])
+    # Override the webhook URL if needed; otherwise BASE_URL + /kixie/webhooks
+    webhook_url: Optional[str] = None
+    # Optional custom names; defaults use goose-<event>
+    names: Dict[str,str] = Field(default_factory=dict)
+
+class RemoveBody(BaseModel):
+    tenant_id: Optional[int] = None
+    # Names to remove; default removes the three Goose webhooks if present
+    names: List[str] = Field(default_factory=lambda: ["goose-endcall","goose-disposition","goose-sms"])
+
+# ───────────────────────── Helpers ─────────────────────────
 
 def _resolve_defaults(body: InstallBody):
     name  = body.name or os.getenv("DEFAULT_TENANT_NAME", "Dev Tenant")
@@ -27,13 +49,56 @@ def _resolve_defaults(body: InstallBody):
         "REALNEX_JWT": rn_jwt
     }.items() if not v]
     if missing:
-        raise HTTPException(
-            400,
-            f"Missing creds: {', '.join(missing)}. Provide in JSON body or set them in .env"
-        )
+        raise HTTPException(400, f"Missing creds: {', '.join(missing)}. Provide in JSON body or set them in .env")
     return name, apikey, bizid, rn_jwt
 
-@router.post("", summary="Install tenant and register Kixie webhooks (uses .env defaults)")
+def _tenant_or_latest(db: Session, tenant_id: Optional[int]) -> Tenant:
+    q = db.query(Tenant).filter(Tenant.active == True)  # noqa: E712
+    if tenant_id is not None:
+        t = q.filter(Tenant.id == tenant_id).first()
+        if not t:
+            raise HTTPException(404, f"Tenant {tenant_id} not found or inactive")
+        return t
+    t = q.order_by(Tenant.id.desc()).first()
+    if not t:
+        raise HTTPException(404, "No active tenant installed")
+    return t
+
+def _kixie_creds_for(t: Tenant) -> tuple[str, str]:
+    return decrypt(t.kixie_api_key_enc), t.kixie_business_id
+
+def _default_webhook_url() -> str:
+    base_url = (os.getenv("BASE_URL", "").rstrip("/"))
+    return f"{base_url}/kixie/webhooks" if base_url else "/kixie/webhooks"
+
+def _payload_for(event: str, name: str, url: str, secret: str) -> Dict[str, Any]:
+    # Kixie expects "headers" as a JSON-stringified array
+    headers = json.dumps([{"name": "X-Goose-Secret", "value": secret}])
+    return {
+        "call": "postWebhook",
+        "eventname": event,          # e.g. endcall | disposition | sms
+        "direction": "all",
+        "callresult": "all",
+        "disposition": "all",
+        "runtime": "realtime",
+        "name": name,
+        "location": url,
+        "headers": headers,
+    }
+
+# ───────────────────────── Endpoints ─────────────────────────
+
+@router.get("/install/health", summary="Installer health & defaults")
+def install_health():
+    return {
+        "BASE_URL": os.getenv("BASE_URL"),
+        "has_KIXIE_API_KEY": bool(os.getenv("KIXIE_API_KEY")),
+        "has_KIXIE_BUSINESS_ID": bool(os.getenv("KIXIE_BUSINESS_ID")),
+        "has_REALNEX_JWT": bool(os.getenv("REALNEX_JWT")),
+        "webhook_target_default": _default_webhook_url(),
+    }
+
+@router.post("/install", summary="Install tenant and register Kixie webhooks (uses .env defaults)")
 async def install(body: InstallBody, db: Session = Depends(get_db)):
     name, apikey, bizid, rn_jwt = _resolve_defaults(body)
 
@@ -48,50 +113,73 @@ async def install(body: InstallBody, db: Session = Depends(get_db)):
     )
     db.add(tenant); db.commit(); db.refresh(tenant)
 
-    base_url = (os.getenv("BASE_URL", "").rstrip("/"))
-    location = f"{base_url}/kixie/webhooks" if base_url else "/kixie/webhooks"
-    headers  = f"[{{\\\"name\\\":\\\"X-Goose-Secret\\\",\\\"value\\\":\\\"{secret}\\\"}}]"
-
-    webhook_errors: list[str] = []
-    for event, wname in [
-        ("endcall", "goose-endcall"),
-        ("disposition", "goose-disposition"),
-        ("sms", "goose-sms"),
-    ]:
-        payload = {
-            "call": "postWebhook",
-            "eventname": event,
-            "direction": "all",
-            "callresult": "all",
-            "disposition": "all",
-            "runtime": "realtime",
-            "name": wname,
-            "location": location,
-            "headers": headers
-        }
+    location = _default_webhook_url()
+    errors: list[str] = []
+    for event, wname in [("endcall","goose-endcall"), ("disposition","goose-disposition"), ("sms","goose-sms")]:
         try:
-            await create_or_update_webhook(apikey, bizid, payload)
+            await create_or_update_webhook(apikey, bizid, _payload_for(event, wname, location, secret))
         except Exception as e:
-            webhook_errors.append(f"{event}: {e}")
+            errors.append(f"{event}: {e}")
 
     return {
         "tenant_id": tenant.id,
         "webhook_secret": secret,
         "webhook_location": location,
-        "ok": len(webhook_errors) == 0,
-        "webhook_errors": webhook_errors
+        "ok": len(errors) == 0,
+        "webhook_errors": errors
     }
 
-@router.get("/tenants", summary="List installed tenants")
+@router.post("/install/webhooks", summary="(Re)install Kixie webhooks for an existing tenant")
+async def reinstall_webhooks(body: ReinstallBody, db: Session = Depends(get_db)):
+    t = _tenant_or_latest(db, body.tenant_id)
+    apikey, bizid = _kixie_creds_for(t)
+    location = body.webhook_url or _default_webhook_url()
+
+    results = []
+    for evt in body.events:
+        name = body.names.get(evt) if body.names else None
+        name = name or f"goose-{evt}"
+        try:
+            resp = await create_or_update_webhook(apikey, bizid, _payload_for(evt, name, location, t.webhook_secret))
+            results.append({"event": evt, "name": name, "status": resp.get("status"), "resp": resp})
+        except Exception as e:
+            results.append({"event": evt, "name": name, "error": str(e)})
+
+    ok = all((r.get("status", 500) < 300) for r in results if "status" in r)
+    return {"tenant_id": t.id, "location": location, "ok": ok, "results": results}
+
+@router.post("/install/webhooks/remove", summary="Remove Goose webhooks by name for an existing tenant")
+async def remove_webhooks(body: RemoveBody, db: Session = Depends(get_db)):
+    t = _tenant_or_latest(db, body.tenant_id)
+    apikey, bizid = _kixie_creds_for(t)
+
+    # Fetch and remove matches
+    listing = await list_webhooks(apikey, bizid)
+    items = (listing.get("data") or listing.get("webhooks") or listing.get("items") or [])
+    removed, misses, errors = [], [], []
+    name_set = set(body.names)
+
+    for it in (items if isinstance(items, list) else []):
+        wid = it.get("webhookid") or it.get("id")
+        nm  = it.get("name") or ""
+        if nm in name_set and wid:
+            try:
+                resp = await delete_webhook(apikey, bizid, str(wid))
+                removed.append({"name": nm, "id": wid, "status": resp.get("status")})
+            except Exception as e:
+                errors.append({"name": nm, "id": wid, "error": str(e)})
+
+    # Track names we didn’t find
+    found_names = {r["name"] for r in removed}
+    misses = [n for n in name_set - found_names]
+
+    ok = (len(errors) == 0)
+    return {"tenant_id": t.id, "removed": removed, "not_found": misses, "errors": errors, "ok": ok}
+
+@router.get("/install/tenants", summary="List installed tenants")
 def list_tenants(db: Session = Depends(get_db)):
     rows = db.query(Tenant).order_by(Tenant.id.desc()).all()
     return [
-        {
-            "id": t.id,
-            "name": t.name,
-            "businessid": t.kixie_business_id,
-            "webhook_secret": t.webhook_secret,
-            "active": t.active,
-        }
+        {"id": t.id, "name": t.name, "businessid": t.kixie_business_id, "webhook_secret": t.webhook_secret, "active": t.active}
         for t in rows
     ]
