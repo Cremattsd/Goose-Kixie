@@ -1,4 +1,4 @@
-# app/main.py
+# app/main.py  (ADD admin router include)
 from dotenv import load_dotenv; load_dotenv()
 
 import os
@@ -9,6 +9,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from .routes.dialer import router as dialer_router
 from .routes.debug_realnex import router as debug_router
 from .routes.powerlist import router as powerlist_router
+from .routes.admin import router as admin_router  # ← add
 
 from .services.db import init_db
 
@@ -37,7 +38,6 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 # ── Basic health/root ─────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    # enumerate routes for quick smoke test
     routes = []
     for r in app.router.routes:
         try:
@@ -54,3 +54,4 @@ def health():
 app.include_router(dialer_router, tags=["dialer"])
 app.include_router(debug_router, tags=["debug"])
 app.include_router(powerlist_router, tags=["kixie"])
+app.include_router(admin_router, tags=["admin"])  # ← add
