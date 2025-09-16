@@ -1,114 +1,109 @@
-# app/services/kixie_api.py
-import os, httpx
-from typing import Dict, Any, List, Optional
-from .realnex_api import normalize_phone_e164ish
+# app/schemas/kixie.py
+from __future__ import annotations
 
-KIXIE_MGMT_BASE = os.getenv("KIXIE_API_BASE", "https://apig.kixie.com/app/v1/api")
-KIXIE_EVENT_BASE = "https://apig.kixie.com/app/event"  # for make-a-call & powerlist
+from typing import Optional, Literal
+from datetime import datetime, timezone
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+    ConfigDict,
+    AliasChoices,
+)
 
-def _api_key() -> str:
-    return os.getenv("KIXIE_API_KEY", "")
+def _to_utc_ms(dt: Optional[datetime], assume_tz: Optional[timezone] = None) -> Optional[str]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=assume_tz or timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def _biz_id() -> str:
-    return os.getenv("KIXIE_BUSINESS_ID", "")
+class KixieWebhook(BaseModel):
+    model_config = ConfigDict(extra="ignore")
 
-async def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json=payload)
+    event: str = Field(default="call.completed")
+    direction: Literal["outbound", "inbound"] = "outbound"
+
+    from_number: Optional[str] = Field(default=None, validation_alias=AliasChoices("from_number","fromNumber","from","caller"))
+    to_number: Optional[str]   = Field(default=None, validation_alias=AliasChoices("to_number","toNumber","to","callee"))
+    agent_email: Optional[str] = Field(default=None, validation_alias=AliasChoices("agent_email","agentEmail","userEmail","agent"))
+    disposition: Optional[str] = None
+
+    duration_sec: int = Field(default=0, validation_alias=AliasChoices("duration_sec","duration","durationSeconds"), ge=0)
+
+    started_at: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("started_at","start_time","startedAt","startTime"))
+    ended_at:   Optional[datetime] = Field(default=None, validation_alias=AliasChoices("ended_at","end_time","endedAt","endTime"))
+
+    recording_url: Optional[str] = Field(default=None, validation_alias=AliasChoices("recording_url","recordingUrl","recording"))
+    call_id: Optional[str]       = Field(default=None, validation_alias=AliasChoices("call_id","callId","id"))
+
+    agent_notes: Optional[str]   = Field(default=None, validation_alias=AliasChoices("agent_notes","agentNotes","notes"))
+
+    @field_validator("started_at", "ended_at", mode="before")
+    @classmethod
+    def _coerce_dt(cls, v):
+        if v in (None, ""):
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, (int, float)):
+            if v > 10**12:
+                v = v / 1000.0
+            return datetime.fromtimestamp(v, tz=timezone.utc)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            if " " in s and "T" not in s:
+                s = s.replace(" ", "T")
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return datetime.fromisoformat(s)
+        return v
+
+    @field_validator("duration_sec", mode="before")
+    @classmethod
+    def _coerce_duration(cls, v):
+        if v in (None, ""):
+            return 0
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return 0
+            try:
+                v = int(float(v))
+            except Exception:
+                return 0
         try:
-            data = r.json()
+            if isinstance(v, (int, float)) and v > 24 * 60 * 60 * 5:
+                v = int(v / 1000)
         except Exception:
-            data = {"raw": r.text}
-        data.setdefault("status", r.status_code)
-        data.setdefault("url", str(r.request.url))
-        return data
+            pass
+        return int(v)
 
-# ── Existing webhook mgmt helpers (kept) ───────────────────────────────────────
-async def create_or_update_webhook(apikey: str, businessid: str, payload: Dict[str, Any]) -> dict:
-    return await _post_json(f"{KIXIE_MGMT_BASE}/postwebhook",
-                            {"apikey": apikey, "businessid": businessid, **payload})
+    @model_validator(mode="after")
+    def _validate_times(self):
+        if self.started_at and self.ended_at and self.ended_at < self.started_at:
+            raise ValueError("ended_at is before started_at")
+        return self
 
-async def list_webhooks(apikey: str, businessid: str) -> dict:
-    return await _post_json(f"{KIXIE_MGMT_BASE}/getWebhooks",
-                            {"apikey": apikey, "businessid": businessid, "call": "getWebhooks"})
+    def target_number(self) -> Optional[str]:
+        return self.to_number if self.direction == "outbound" else self.from_number
 
-async def delete_webhook(apikey: str, businessid: str, webhookid: str) -> dict:
-    return await _post_json(f"{KIXIE_MGMT_BASE}/deleteWebhooks",
-                            {"apikey": apikey, "businessid": businessid, "call": "removeWebhook", "webhookid": webhookid})
+    def start_utc_ms(self, assume_tz: Optional[timezone] = None) -> Optional[str]:
+        return _to_utc_ms(self.started_at, assume_tz)
 
-# ── Make-a-call (FYI) ─────────────────────────────────────────────────────────
-async def make_call(email: str, target_e164: str, displayname: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Uses Kixie's 'Make a Call' API (POST to /app/event?apikey=...)
-    """
-    apikey, biz = _api_key(), _biz_id()
-    payload = {
-        "businessid": biz,
-        "email": email,
-        "target": target_e164,
-        "displayname": displayname or target_e164,
-        "eventname": "call",
-        "apikey": apikey,
-    }
-    return await _post_json(f"{KIXIE_EVENT_BASE}?apikey={apikey}", payload)
+    def end_utc_ms(self, assume_tz: Optional[timezone] = None) -> Optional[str]:
+        return _to_utc_ms(self.ended_at, assume_tz)
 
-# ── PowerList helpers (NEW) ───────────────────────────────────────────────────
-async def add_to_powerlist_one(powerlist_id: str,
-                               phone_raw: str,
-                               first_name: str | None = None,
-                               last_name: str | None = None,
-                               company: str | None = None,
-                               email: str | None = None,
-                               extra_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Add ONE number to a PowerList (Kixie API only supports one-at-a-time).
-    Docs: https://support.kixie.com/hc/en-us/articles/19135310564635-Powerlist-API
-    """
-    apikey, biz = _api_key(), _biz_id()
-    target = normalize_phone_e164ish(phone_raw) or phone_raw
-    payload = {
-        "businessid": biz,
-        "powerlistId": powerlist_id,
-        "apikey": apikey,
-        "target": target,
-        "eventname": "updatepowerlist",
-        "firstName": first_name or "",
-        "lastName": last_name or "",
-        "companyName": company or "",
-        "email": email or "",
-    }
-    if extra_data:
-        payload["extraData"] = extra_data
-    return await _post_json(f"{KIXIE_EVENT_BASE}?apikey={apikey}", payload)
+class SimpleContact(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str]  = None
+    email: Optional[str]      = None
+    phone: Optional[str]      = None
+    company: Optional[str]    = None
 
-async def add_many_to_powerlist(powerlist_id: str, contacts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    contacts: [{phone, first_name?, last_name?, company?, email?, extra_data?}, ...]
-    """
-    out = {"powerlistId": powerlist_id, "ok": 0, "skipped": 0, "fail": 0, "results": []}
-    seen: set[str] = set()
-    for c in contacts:
-        raw = c.get("phone") or c.get("target") or ""
-        norm = normalize_phone_e164ish(raw) or raw
-        if not norm:
-            out["skipped"] += 1
-            out["results"].append({"phone": raw, "status": "skipped_no_phone"})
-            continue
-        if norm in seen:
-            out["skipped"] += 1
-            out["results"].append({"phone": norm, "status": "skipped_duplicate"})
-            continue
-        seen.add(norm)
-        resp = await add_to_powerlist_one(
-            powerlist_id=powerlist_id,
-            phone_raw=norm,
-            first_name=c.get("first_name"),
-            last_name=c.get("last_name"),
-            company=c.get("company"),
-            email=c.get("email"),
-            extra_data=c.get("extra_data"),
-        )
-        ok = 200 <= resp.get("status", 0) < 300
-        out["ok" if ok else "fail"] += 1
-        out["results"].append({"phone": norm, "resp": resp, "ok": ok})
-    return out
+    def full_name(self) -> str:
+        parts = [self.first_name or "", self.last_name or ""]
+        return " ".join([p for p in parts if p]).strip() or "Unknown"

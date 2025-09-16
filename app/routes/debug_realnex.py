@@ -1,4 +1,6 @@
 # app/routes/debug_realnex.py
+from __future__ import annotations
+
 from fastapi import APIRouter, Query
 import os, httpx
 from typing import List, Dict, Any
@@ -6,9 +8,13 @@ from typing import List, Dict, Any
 from ..services.realnex_api import (
     probe_endpoints, get_rn_token, BASES,
     get_table_definition,
-    probe_odata_phone_fields,
-    odata_contacts_filter_by_digits,
 )
+
+# Try to import the older helpers from realnex_api first; if missing, use odata_phone_search aliases
+try:
+    from ..services.realnex_api import probe_odata_phone_fields, odata_contacts_filter_by_digits, digits_only  # type: ignore
+except Exception:
+    from ..services.odata_phone_search import probe_odata_phone_fields, odata_contacts_filter_by_digits, digits_only  # type: ignore
 
 router = APIRouter()
 
@@ -74,7 +80,6 @@ async def debug_try_paths(
                     out["attempts"].append({"url": url, "error": str(e)})
     return out
 
-# NEW: see contact field defs (so you can eyeball phone-esque names)
 @router.get("/debug/realnex/definitions/contacts")
 async def debug_defs_contacts():
     token = get_rn_token()
@@ -82,7 +87,6 @@ async def debug_defs_contacts():
         return {"status": "dry-run"}
     return await get_table_definition(token, "Contacts")
 
-# NEW: what phone fields did we validate for OData?
 @router.get("/debug/realnex/odata/phone_fields")
 async def debug_odata_phone_fields():
     token = get_rn_token()
@@ -91,13 +95,11 @@ async def debug_odata_phone_fields():
     fields = await probe_odata_phone_fields(token)
     return {"fields": fields}
 
-# Optional: raw wide search by digits (uses probed fields)
 @router.get("/debug/realnex/search_phone")
 async def debug_search_phone(phone: str = Query(...)):
     token = get_rn_token()
     if not token:
         return {"status": "dry-run"}
-    from ..services.realnex_api import digits_only
     d = digits_only(phone) or ""
     fields = await probe_odata_phone_fields(token)
     wide = await odata_contacts_filter_by_digits(token, d, fields, top=5)

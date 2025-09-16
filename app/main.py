@@ -1,59 +1,57 @@
-# app/main.py  (append router include)
-from dotenv import load_dotenv; load_dotenv()
+# app/main.py
+from __future__ import annotations
 
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-
-from .routes.dialer import router as dialer_router
-from .routes.debug_realnex import router as debug_router
-from .routes.powerlist import router as powerlist_router
-from .routes.admin import router as admin_router
-from .routes.click_to_dial import router as ctd_router  # ← add
 
 from .services.db import init_db
+from .routes.dialer import router as dialer_router
+from .routes.debug_realnex import router as debug_router
+from .routes.click_to_dial import router as click_router
+from .routes.install import router as install_router
 
-app = FastAPI(title="Goose-Kixie (RealNex)")
+APP_NAME = os.getenv("APP_NAME", "Goose Kixie Bridge")
 
-# ── DB init on startup (dev-friendly; disable with DB_CREATE_ALL=0)
-if os.getenv("DB_CREATE_ALL", "1") not in ("0", "false", "False"):
-    try:
-        init_db()
-    except Exception as e:
-        print(f"[init_db] warning: {e}")
+app = FastAPI(title=APP_NAME)
 
-# ── Middleware: CORS & Trusted Hosts
-origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()]
+# CORS
+origins = os.getenv("CORS_ALLOW_ORIGINS", "*")
+if origins == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [o.strip() for o in origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-allowed_hosts = [h.strip() for h in os.getenv("TRUSTED_HOSTS", "*").split(",") if h.strip()]
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+# Auto DB create in dev
+if os.getenv("DB_CREATE_ALL", "1") in ("1", "true", "yes"):
+    try:
+        init_db()
+    except Exception:
+        pass
 
-# ── Basic health/root
-@app.get("/")
+# Routers
+app.include_router(install_router, prefix="/install", tags=["install"])
+app.include_router(click_router)
+app.include_router(dialer_router)
+app.include_router(debug_router, prefix="")
+
+@app.get("/", tags=["root"])
 def root():
-    routes = []
-    for r in app.router.routes:
-        try:
-            routes.append({"path": r.path, "methods": list(r.methods), "name": r.name})
-        except Exception:
-            pass
-    return {"ok": True, "routes": routes}
+    return {
+        "ok": True,
+        "routes": [
+            {"path": r.path, "methods": sorted(list(r.methods or [])), "name": r.name}
+            for r in app.router.routes
+        ],
+    }
 
-@app.get("/health")
+@app.get("/health", tags=["root"])
 def health():
     return {"ok": True}
-
-# ── Routers
-app.include_router(dialer_router, tags=["dialer"])
-app.include_router(debug_router, tags=["debug"])
-app.include_router(powerlist_router, tags=["kixie"])
-app.include_router(admin_router, tags=["admin"])
-app.include_router(ctd_router, tags=["dialer"])  # ← add

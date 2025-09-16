@@ -1,10 +1,11 @@
+# app/services/odata_phone_search.py
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional, Tuple, Set
 import httpx
 
-# OData param required on your tenant(s)
+# OData param your tenant(s) require
 _ODATA_DEFAULT_PARAMS = {"api-version": "1.0"}
 
 def _merge_params(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -30,7 +31,7 @@ def _truthy(v: Any) -> bool:
     if isinstance(v, str): return v.strip().lower() in {"1","true","yes","y","t"}
     return False
 
-# ---- The host app must provide these via import (from realnex_api) ----
+# ---- Host app plumbing (import from realnex_api) ----
 from .realnex_api import BASES, _client, _send, _format_resp  # noqa: E402
 
 # ---------- Seeds ----------
@@ -41,7 +42,6 @@ DEFAULT_FIELD_SEEDS = {
 }
 
 DEFAULT_DNC_FIELD_SEEDS = {
-    # Broad/tenancy-safe guesses; we validate each via $select
     "Contacts": {
         "call": ["DoNotCall","Dnc","DNC","DoNotPhone","NoCall","NoPhone","DoNotContactPhone"],
         "fax":  ["DoNotFax","NoFax"],
@@ -291,11 +291,7 @@ async def search_digits(
     exclude_fax: bool = True,
 ) -> Dict[str, Any]:
     """
-    Tenant-safe phone search with DNC awareness:
-      • probes phone fields
-      • probes DNC fields (DoNotCall, DoNotFax, DoNotText variants)
-      • tries contains()+cast when needed, else page-scan
-      • filters out rows with DoNotCall=True, and fax-only hits (or DoNotFax=True)
+    Tenant-safe phone search with DNC awareness.
     """
     digits = re.sub(r"\D+", "", phone_raw or "")
     if not digits:
@@ -311,25 +307,36 @@ async def search_digits(
     if int(tried.get("status", 0)) // 100 == 2 and (tried.get("value") or tried.get("data")):
         return tried
     if tried.get("status") in (200, 204, 404, 400, 599):
-        # Fallback to scan if filter failed, empty, or filtered all out
         scanned = await _scan_pages(token, entity, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=exclude_fax)
         if int(scanned.get("status", 0)) // 100 == 2:
             return scanned
-        # Bubble a consistent 404 showing what we tried
         if tried.get("status") in (200, 204):
             return {"status": 404, "error": "odata_empty_or_filtered_by_dnc", "probe_fields": fields, "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
         return {"status": 404, "error": "odata_no_match", "probe_fields": fields, "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
-    # Should not reach here, but in case
     return {"status": 404, "error": "unknown_state", "probe_fields": fields, "dnc_fields": dnc_fields}
 
-# ---------- Compatibility aliases for existing imports ----------
+# ---------- Back-compat exports for existing imports ----------
+def digits_only(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    d = re.sub(r"\D+", "", raw)
+    return d or None
+
 async def probe_odata_phone_fields(token: str) -> List[str]:
-    """Alias used by older code paths; probes Contacts phone-ish fields."""
     return await probe_phone_fields(token, "Contacts")
 
 async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
-    """
-    Alias used by older code paths; ignores `fields` (we probe inside) but
-    preserves the signature expected by debug routes.
-    """
-    return await search_digits(token, "Contacts", digits, top=top)
+    dnc_fields = await probe_dnc_fields(token, "Contacts")
+    tried = await _try_contains(token, "Contacts", digits, fields, dnc_fields, top, exclude_fax=True)
+    if int(tried.get("status", 0)) // 100 == 2:
+        vals = tried.get("value") or tried.get("data") or []
+        if isinstance(vals, list) and vals:
+            return tried
+        scanned = await _scan_pages(token, "Contacts", digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
+        if int(scanned.get("status", 0)) // 100 == 2:
+            return scanned
+        return {"status": 404, "error": "odata_empty_or_filtered_by_dnc", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
+    scanned = await _scan_pages(token, "Contacts", digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
+    if int(scanned.get("status", 0)) // 100 == 2:
+        return scanned
+    return {"status": tried.get("status", 400), "error": "odata_no_match", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}

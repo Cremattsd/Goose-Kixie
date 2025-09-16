@@ -1,10 +1,10 @@
-# app/services/db.py  (ADD one import line inside init_db)
+# app/services/db.py
 import os
 from contextlib import contextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./goose_kixie.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./goose.db")
 
 engine_kwargs = {}
 if DATABASE_URL.startswith("sqlite"):
@@ -25,11 +25,9 @@ def init_db() -> None:
     """
     Import models so SQLAlchemy sees them, then create tables.
     """
-    # Import all models here (order doesn't matter)
     from ..models import tenant          # noqa
-    from ..models import eventlog        # noqa
-    from ..models import dialer_queue    # noqa
+    from ..models import eventlog        # noqa  (ok if not present in your repo)
+    from ..models import dialer_queue    # noqa  (ok if not present in your repo)
     from ..models import call_state      # noqa
-    from ..models import app_setting     # ← add this import  # noqa
 
     Base.metadata.create_all(bind=engine)
