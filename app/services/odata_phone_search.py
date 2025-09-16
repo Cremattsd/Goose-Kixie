@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from typing import Any, Dict, List, Optional, Tuple, Set
 import httpx
@@ -319,3 +321,15 @@ async def search_digits(
         return {"status": 404, "error": "odata_no_match", "probe_fields": fields, "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
     # Should not reach here, but in case
     return {"status": 404, "error": "unknown_state", "probe_fields": fields, "dnc_fields": dnc_fields}
+
+# ---------- Compatibility aliases for existing imports ----------
+async def probe_odata_phone_fields(token: str) -> List[str]:
+    """Alias used by older code paths; probes Contacts phone-ish fields."""
+    return await probe_phone_fields(token, "Contacts")
+
+async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
+    """
+    Alias used by older code paths; ignores `fields` (we probe inside) but
+    preserves the signature expected by debug routes.
+    """
+    return await search_digits(token, "Contacts", digits, top=top)
