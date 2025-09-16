@@ -1,16 +1,20 @@
-# app/routes/debug_realnex.py
+from __future__ import annotations
+
 from fastapi import APIRouter, Query
 import os, httpx
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from ..services.realnex_api import (
     probe_endpoints, get_rn_token, BASES,
     get_table_definition,
-    probe_odata_phone_fields,
-    odata_contacts_filter_by_digits,
-    list_timezones,
-    odata_contacts_iter,
 )
+
+# Prefer helpers from realnex_api; fall back to odata_phone_search if split
+try:
+    from ..services.realnex_api import probe_odata_phone_fields, odata_contacts_filter_by_digits, digits_only
+except ImportError:
+    from ..services.odata_phone_search import probe_odata_phone_fields, odata_contacts_filter_by_digits  # type: ignore
+    from ..services.realnex_api import digits_only  # still in realnex_api
 
 router = APIRouter()
 
@@ -99,36 +103,7 @@ async def debug_search_phone(phone: str = Query(...)):
     token = get_rn_token()
     if not token:
         return {"status": "dry-run"}
-    from ..services.realnex_api import digits_only
     d = digits_only(phone) or ""
     fields = await probe_odata_phone_fields(token)
     wide = await odata_contacts_filter_by_digits(token, d, fields, top=5)
     return {"digits": d, "fields": fields, "wide": wide}
-
-# NEW: list timezones RealNex knows about (handy for X-User-TZ validation)
-@router.get("/debug/realnex/timezones")
-async def debug_timezones():
-    token = get_rn_token()
-    if not token:
-        return {"status": "dry-run"}
-    return await list_timezones(token)
-
-# NEW: dump contacts through OData iterator (for tenant shape troubleshooting)
-@router.get("/debug/realnex/odata/contacts")
-async def debug_odata_contacts(
-    select: Optional[str] = Query(None, description="Comma-separated field names"),
-    filter: Optional[str] = Query(None, description="OData $filter expression"),
-    top: int = Query(100, ge=1, le=500),
-    max_rows: int = Query(300, ge=1, le=5000),
-):
-    token = get_rn_token()
-    if not token:
-        return {"status": "dry-run"}
-    out: List[Dict[str, Any]] = []
-    async for page in odata_contacts_iter(
-        token=token, select=select, filter=filter, top=top, max_rows=max_rows
-    ):
-        out.extend(page)
-        if len(out) >= max_rows:
-            break
-    return {"count": len(out), "items": out[:max_rows]}
