@@ -4,6 +4,7 @@ import os
 from typing import Optional, Dict, Any
 import httpx
 
+
 def _kx_headers(api_key: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
@@ -12,8 +13,10 @@ def _kx_headers(api_key: str) -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
+
 def _kx_base() -> str:
     return os.getenv("KIXIE_BASE_URL", "https://api.kixie.com")
+
 
 async def make_call(
     email: str,
