@@ -163,17 +163,10 @@ async def create_task(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     return await _try_paths(
         "POST",
-        [
-            "task", "Task", "tasks", "Tasks",
-            "todo", "Todo",                 # some tenants expose Todo endpoints
-            "CRM/task", "CRM/Task", "CRM/tasks", "CRM/Tasks"
-        ],
+        ["task", "Task", "tasks", "Tasks", "CRM/task", "CRM/Task"],
         token,
         json=payload,
     )
-
-async def list_tasks(token: str, top: int = 5) -> Dict[str, Any]:
-    return await _try_paths("GET", [f"tasks?top={top}", f"Tasks?top={top}", "CRM/Tasks"], token)
 
 async def get_contact(token: str, contact_key: str) -> Dict[str, Any]:
     k = contact_key
@@ -512,6 +505,26 @@ async def odata_contacts_iter(
             skip += top
 
 # ─────────────── Public search helpers ───────────────
+
+async def odata_contacts_filter_by_digits(token: str, digits: str, fields: List[str], top: int = 5) -> Dict[str, Any]:
+    # Probe DNC flags once
+    dnc_fields = await probe_odata_dnc_fields(token)
+    # 1) Try server-side contains() (with per-field cast if needed) with DNC filtering
+    tried = await _odata_try_contains(token, digits, fields, dnc_fields, top, exclude_fax=True)
+    if int(tried.get("status", 0)) // 100 == 2:
+        vals = tried.get("value") or tried.get("data") or []
+        if isinstance(vals, list) and vals:
+            return tried
+        # 2) No rows or filtered out? fall back to scan
+        scanned = await _odata_scan_pages(token, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
+        if int(scanned.get("status", 0)) // 100 == 2:
+            return scanned
+        return {"status": 404, "error": "odata_empty_or_filtered_by_dnc", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
+    # 3) Filter parse failed; try scan outright
+    scanned = await _odata_scan_pages(token, digits, fields, dnc_fields, page_top=100, max_pages=10, exclude_fax=True)
+    if int(scanned.get("status", 0)) // 100 == 2:
+        return scanned
+    return {"status": tried.get("status", 400), "error": "odata_no_match", "dnc_fields": dnc_fields, "tried": tried, "scan": scanned}
 
 async def search_contact_by_phone_wide(token: str, phone_raw: str) -> Dict[str, Any]:
     digits = digits_only(phone_raw) or ""
