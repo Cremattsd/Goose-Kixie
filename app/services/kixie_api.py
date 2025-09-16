@@ -1,20 +1,10 @@
-# from repo root
-mkdir -p app/services
-
-cat > app/services/kixie_api.py <<'EOF'
 from __future__ import annotations
 
 import os
 from typing import Optional, Dict, Any
-
 import httpx
 
-# Minimal Kixie client with a safe fallback.
-# If KIXIE_API_KEY / KIXIE_BUSINESS_ID are not set, we return a 202 "skipped"
-# so your /dialer/call/make endpoint still works for demos/tests.
-
 def _kx_headers(api_key: str) -> Dict[str, str]:
-    # Not sure which scheme your Kixie tenant prefers; include both common patterns.
     return {
         "Authorization": f"Bearer {api_key}",
         "X-API-KEY": api_key,
@@ -23,7 +13,6 @@ def _kx_headers(api_key: str) -> Dict[str, str]:
     }
 
 def _kx_base() -> str:
-    # Allow override; default guessed public base.
     return os.getenv("KIXIE_BASE_URL", "https://api.kixie.com")
 
 async def make_call(
@@ -35,17 +24,14 @@ async def make_call(
     Trigger a Kixie click-to-dial. If Kixie creds aren't configured, returns a harmless stub.
 
     Env:
-      KIXIE_API_KEY       -> your API key
-      KIXIE_BUSINESS_ID   -> your business/account id
-      KIXIE_BASE_URL      -> optional, defaults to https://api.kixie.com
-      KIXIE_CALL_PATH     -> optional, defaults to /v1/calls (POST)
-
-    Returns a dict with status + payload; never raises.
+      KIXIE_API_KEY
+      KIXIE_BUSINESS_ID
+      KIXIE_BASE_URL (optional, default https://api.kixie.com)
+      KIXIE_CALL_PATH (optional, default /v1/calls)
     """
     api_key = os.getenv("KIXIE_API_KEY", "").strip()
     biz_id  = os.getenv("KIXIE_BUSINESS_ID", "").strip()
 
-    # No credentials? Return a stub so demos don’t break.
     if not api_key or not biz_id:
         return {
             "status": 202,
@@ -81,4 +67,3 @@ async def make_call(
             }
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url, "request": {"json": body}}
-EOF
