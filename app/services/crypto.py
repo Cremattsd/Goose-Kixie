@@ -1,53 +1,93 @@
+# app/services/crypto.py
 from __future__ import annotations
 
 import os
-import base64
 from typing import List
 from cryptography.fernet import Fernet, MultiFernet
 
 
+# ───────────────────────── Key loading ─────────────────────────
+
+def _raw_keys_from_env() -> List[str]:
+    """
+    Reads keys from env, preferring ENCRYPTION_KEYS (comma-separated),
+    else falling back to ENCRYPTION_KEY.
+    """
+    many = os.getenv("ENCRYPTION_KEYS")
+    if many and many.strip():
+        return [s.strip() for s in many.split(",") if s.strip()]
+
+    single = os.getenv("ENCRYPTION_KEY")
+    return [single.strip()] if single and single.strip() else []
+
+
 def _load_keys() -> List[bytes]:
     """
-    Load Fernet keys from env. Supports rotation via ENCRYPTION_KEYS (comma-separated).
-    Falls back to ENCRYPTION_KEY. If none set, generates an ephemeral key (dev only).
+    Validate & return Fernet keys as bytes. Raises if none are configured.
     """
-    raw = (os.getenv("ENCRYPTION_KEYS") or os.getenv("ENCRYPTION_KEY") or "").strip()
-    keys: List[bytes] = []
-    if raw:
-        for part in raw.split(","):
-            k = part.strip()
-            if k:
-                keys.append(k.encode("utf-8"))
+    raw = _raw_keys_from_env()
+    if not raw:
+        raise RuntimeError(
+            "No ENCRYPTION_KEY(S) configured. Generate one:\n"
+            "  python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'\n"
+            "Then set ENCRYPTION_KEY (or ENCRYPTION_KEYS) in your .env"
+        )
 
-    if not keys:
-        # Dev fallback: ephemeral key so the app can boot locally.
-        eph = base64.urlsafe_b64encode(os.urandom(32))
-        keys = [eph]
-        # Also set env so subsequent imports use the same key this process.
-        os.environ["ENCRYPTION_KEY"] = eph.decode("utf-8")
-        os.environ["ENCRYPTION_KEYS"] = os.environ["ENCRYPTION_KEY"]
-    return keys
-
-
-def get_fernet():
-    keys = _load_keys()
-    fernets = [Fernet(k) for k in keys]
-    return MultiFernet(fernets) if len(fernets) > 1 else fernets[0]
+    out: List[bytes] = []
+    for s in raw:
+        key = s.encode("utf-8")
+        # Validate by constructing a Fernet instance
+        Fernet(key)
+        out.append(key)
+    return out
 
 
-def encrypt(plaintext: str) -> str:
+# Primary first, older keys after (for rotation)
+_F = MultiFernet([Fernet(k) for k in _load_keys()])
+
+
+# ───────────────────────── Public API ─────────────────────────
+
+def encrypt(plain: str | bytes | None) -> str:
     """
-    Encrypt plaintext to a Fernet token (URL-safe base64 string).
+    Encrypts a value to a Fernet token (str).
+    None -> "" so we don't store the string "None".
     """
-    f = get_fernet()
-    token = f.encrypt(plaintext.encode("utf-8"))
-    return token.decode("utf-8")
+    if plain is None:
+        return ""
+    if isinstance(plain, str):
+        data = plain.encode("utf-8")
+    elif isinstance(plain, bytes):
+        data = plain
+    else:
+        data = str(plain).encode("utf-8")
+    return _F.encrypt(data).decode("utf-8")
 
 
-def decrypt(token: str) -> str:
+def decrypt(token: str | bytes | None) -> str:
     """
-    Decrypt a Fernet token back to plaintext.
+    Decrypts a Fernet token back to utf-8 text.
+    Empty/None -> "" (idempotent for optional fields).
     """
-    f = get_fernet()
-    data = f.decrypt(token.encode("utf-8"))
-    return data.decode("utf-8")
+    if token is None or token == "":
+        return ""
+    if isinstance(token, str):
+        t = token.encode("utf-8")
+    elif isinstance(token, bytes):
+        t = token
+    else:
+        raise TypeError("token must be str or bytes")
+    return _F.decrypt(t).decode("utf-8")
+
+
+def rotate(token: str | bytes) -> str:
+    """
+    Re-encrypt an existing token with the primary key (useful after key rotation).
+    """
+    if isinstance(token, str):
+        t = token.encode("utf-8")
+    elif isinstance(token, bytes):
+        t = token
+    else:
+        raise TypeError("token must be str or bytes")
+    return _F.rotate(t).decode("utf-8")

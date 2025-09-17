@@ -1,4 +1,6 @@
 # app/services/realnex_api.py
+from __future__ import annotations
+
 import os, re, base64, asyncio, httpx, json
 from typing import Any, Dict, Optional, List, Tuple, Set
 from urllib.parse import urlparse, unquote

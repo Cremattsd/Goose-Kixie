@@ -1,30 +1,39 @@
+# app/models/tenant.py
 from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import String, Integer, DateTime, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import String, Integer, DateTime, func, JSON, Boolean
-from ..services.db import Base
+
+from app.services.db import Base
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 class Tenant(Base):
-    __tablename__ = "tenant"
+    __tablename__ = "tenants"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
-    # RealNex config
-    rn_user_key: Mapped[str] = mapped_column(String(64), index=True)
-    rn_team_key: Mapped[str] = mapped_column(String(64), index=True)
-    rn_project_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    rn_event_type_phone: Mapped[int] = mapped_column(Integer, default=0)
-    rn_status_completed: Mapped[int] = mapped_column(Integer, default=0)
-    rn_history_link_field: Mapped[str] = mapped_column(String(32), default="contactKey")  # or partyKey
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    # Encrypted secrets (store encrypted strings; use services/crypto to wrap)
-    realnex_token_enc: Mapped[str | None] = mapped_column(String(4096), nullable=True)
-    kixie_api_key_enc: Mapped[str | None] = mapped_column(String(4096), nullable=True)
-    kixie_business_id_enc: Mapped[str | None] = mapped_column(String(4096), nullable=True)
-    kixie_webhook_secret_enc: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # housekeeping
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
 
-    # Misc
-    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # app + security
+    webhook_secret: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    base_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
 
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    # Kixie
+    kixie_business_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    kixie_api_key_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # RealNex (name matches install.py usage)
+    rn_jwt_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Tenant(id={self.id}, biz={self.kixie_business_id!r}, base={self.base_url!r}, active={self.active})"

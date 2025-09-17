@@ -84,10 +84,10 @@ async def dialer_make_call(body: MakeCallBody, request: Request, db: Session = D
         row = CallState(call_id=call_id)
         db.add(row)
     row.agent_email = body.agent_email or row.agent_email
-    row.phone_e164  = target
+    row.phone_e164 = target
     if not row.started_at:
         row.started_at = datetime.now(timezone.utc)
-    row.updated_at  = datetime.now(timezone.utc)
+    row.updated_at = datetime.now(timezone.utc)
     db.commit()
 
     # Fire Kixie event

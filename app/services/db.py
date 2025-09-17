@@ -1,33 +1,78 @@
 # app/services/db.py
+from __future__ import annotations
+
 import os
 from contextlib import contextmanager
+from typing import Generator
+
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./goose.db")
 
-engine_kwargs = {}
-if DATABASE_URL.startswith("sqlite"):
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
+# ───────────────────────── Engine / Session ─────────────────────────
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, **engine_kwargs)
-SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./goose.db").strip()
+
+# SQLite needs a special connect arg when used in a single-threaded dev server
+_connect_args = {}
+if DATABASE_URL.startswith("sqlite:///"):
+    _connect_args = {"check_same_thread": False}
+
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+    connect_args=_connect_args,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    future=True,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
+
 Base = declarative_base()
 
-def get_db():
-    db = SessionLocal()
+
+# ───────────────────────── DB Helpers ─────────────────────────
+
+def get_db() -> Generator[Session, None, None]:
+    """
+    FastAPI dependency: yields a SQLAlchemy session and closes it after the request.
+    """
+    db: Session = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
+
+@contextmanager
+def session_scope() -> Generator[Session, None, None]:
+    """
+    Optional context manager for scripts/jobs.
+    """
+    db: Session = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def init_db() -> None:
     """
-    Import models so SQLAlchemy sees them, then create tables.
+    Import models and create tables (used by app/main.py when DB_CREATE_ALL=1).
+    Safe to call multiple times.
     """
-    from ..models import tenant          # noqa
-    from ..models import eventlog        # noqa  (ok if not present in your repo)
-    from ..models import dialer_queue    # noqa  (ok if not present in your repo)
-    from ..models import call_state      # noqa
+    # Import models so their metadata is registered on Base
+    # (keep imports local to avoid circular import issues)
+    from app.models import tenant  # noqa: F401
+    from app.models import call_state  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
