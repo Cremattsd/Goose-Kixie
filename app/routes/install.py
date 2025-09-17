@@ -125,7 +125,12 @@ async def install(body: InstallBody, db: Session = Depends(get_db)):
         base_url=os.getenv("BASE_URL"),
         kixie_business_id=bizid,
         kixie_api_key_enc=encrypt(apikey),
-        realnex_jwt_enc=encrypt(rn_jwt),
+        rn_jwt_enc=encrypt(rn_jwt),
+    ),
+        base_url=os.getenv("BASE_URL"),
+        kixie_business_id=bizid,
+        kixie_api_key_enc=encrypt(apikey),
+        rn_jwt_enc=encrypt(rn_jwt),
     )
     db.add(tenant)
     db.commit()
