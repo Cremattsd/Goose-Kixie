@@ -116,7 +116,20 @@ async def make_call(
         "to": target_e164,
         "displayname": displayname or target_e164,
     }
-    return await _post(url, _kx_headers(key), body)
+        # Add optional caller ID if provided
+    caller_id = os.getenv("KIXIE_CALLER_ID")
+    if caller_id:
+        body["from"] = caller_id
+
+    # Provide alternate field names some tenants expect
+    body.setdefault("agent_email", email)
+    body.setdefault("user_email", email)
+
+    # Some tenants require business id in a header
+    headers = _kx_headers(key)
+    headers["X-Business-Id"] = biz
+
+    return await _post(url, headers, body)
 
 
 # ───────────────────────── Webhook Admin ─────────────────────────
