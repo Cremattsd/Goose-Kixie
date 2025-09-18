@@ -66,7 +66,7 @@ async def _find_contact_key(token: str, e164: str) -> Optional[str]:
 # ───────────────────────── Endpoints ───────────────────────
 
 @router.post("/dialer/call/make")
-async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret: Optional[str] = Header(None, alias=\"X-Goose-Secret\"), db: Session = Depends(get_db)):
+async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret: Optional[str] = Header(None, alias="X-Goose-Secret"), db: Session = Depends(get_db)):
     """
     Click-to-dial: triggers Kixie Make-a-Call, starts CallState timer,
     and returns an optional RealNex deep link if a contact match exists.
