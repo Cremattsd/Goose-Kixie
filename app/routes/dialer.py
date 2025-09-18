@@ -21,7 +21,7 @@ from ..services.realnex_api import (
     search_by_phone,                          # CRM-native search (if tenant supports)
     create_contact,
     create_history,
-    create_task,
+    create_event,
     get_rn_token,
     search_contact_keys_by_phone_two_stage,   # OData probe + CRM verify
     attach_recording_from_url,
@@ -147,9 +147,16 @@ async def _post_history_and_optional_task(
     token: str,
     contact_key: str,
 ) -> Dict[str, Any]:
-    # Build History payload (use schema’s UTC helpers)
+    # Build History payload
     start_iso = payload.start_utc_ms(tz_assume)
     end_iso   = payload.end_utc_ms(tz_assume)
+
+    # Safety: some payloads don’t include a clean end; use start if needed
+    if not start_iso:
+        from datetime import datetime, timezone
+        start_iso = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z")
+    if not end_iso:
+        end_iso = start_iso
 
     event_type_key = int(os.getenv("RN_EVENT_TYPE_PHONE", os.getenv("RN_EVENTTYPEKEY_CALL", "1")))
     status_key     = int(os.getenv("RN_STATUS_COMPLETED", "0"))
@@ -188,28 +195,46 @@ async def _post_history_and_optional_task(
     if os.getenv("ATTACH_RECORDING_TO_CONTACT", "0") == "1" and payload.recording_url:
         out["attachment"] = await attach_recording_from_url(token, contact_key, payload.recording_url)
 
-    # Optional auto-task
+    # Optional auto-follow-up as an EVENT (not Task)
     if auto_tasks:
         trigger_set = _auto_task_dispo_set()
         if (payload.disposition or "").strip().lower() in trigger_set:
             subj = f"Follow up: {payload.disposition or 'Call'}"
-            notes = f"Auto-task from call ({payload.direction or 'n/a'}). ContactKey: {contact_key}\n" \
-                    f"Number: {payload.to_number or payload.from_number or ''}\n" \
-                    f"Call ID: {payload.call_id or ''}"
-            due = _due_iso(end_iso)
-            task = {
+            notes = (
+                f"Auto-follow-up (Event) from call ({payload.direction or 'n/a'}). "
+                f"ContactKey: {contact_key}\n"
+                f"Number: {payload.to_number or payload.from_number or ''}\n"
+                f"Call ID: {payload.call_id or ''}"
+            )
+            # event window = next day for 30 minutes
+            from datetime import datetime, timezone, timedelta
+            due = (datetime.fromisoformat(end_iso.replace("Z","+00:00")) if "T" in end_iso
+                   else datetime.now(timezone.utc)) + timedelta(days=1)
+            sd = due.astimezone(timezone.utc)
+            ed = (sd + timedelta(minutes=int(os.getenv("RN_EVENT_DURATION_MINUTES","30")))).astimezone(timezone.utc)
+            start_ev = sd.isoformat(timespec="milliseconds").replace("+00:00","Z")
+            end_ev   = ed.isoformat(timespec="milliseconds").replace("+00:00","Z")
+
+            event = {
                 "subject": subj,
                 "notes": notes,
-                "dueDate": due,
-                "DueDate": due,  # be generous with field name
+                "startDate": start_ev,
+                "endDate": end_ev,
+                "timeless": False,
+                "allDay": False,
+                "finished": False,
+                "alarmMinutes": int(os.getenv("RN_EVENT_ALARM_MINUTES","0")),
+                "eventTypeKey": event_type_key,
+                # Link to contact (works in many tenants; adjust if your tenant uses a different link field)
                 "contactKey": contact_key,
             }
-            if os.getenv("RN_USER_KEY"):
-                task["userKey"] = os.getenv("RN_USER_KEY")
-            if os.getenv("RN_TEAM_KEY"):
-                task["teamKey"] = os.getenv("RN_TEAM_KEY")
-            rn_task = await create_task(token, task)
-            out["auto_task"] = {"post_body": task, "realnex_task": rn_task}
+            if os.getenv("RN_USER_KEY"):   event["userKey"]   = os.getenv("RN_USER_KEY")
+            if os.getenv("RN_TEAM_KEY"):   event["teamKey"]   = os.getenv("RN_TEAM_KEY")
+            if os.getenv("RN_PROJECT_KEY"):event["projectKey"]= os.getenv("RN_PROJECT_KEY")
+
+            rn_event = await create_event(token, {k: v for k, v in event.items() if v is not None})
+            out["auto_task"] = {"type":"event", "post_body": event, "realnex_event": rn_event}
+
     return out
 
 # ───────────────────────── Routes: Contact lookup ─────────────────────────────
