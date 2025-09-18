@@ -701,3 +701,17 @@ async def probe_endpoints(token: str) -> Dict[str, Any]:
                 except Exception as e:
                     out["checks"].append({"url": url, "error": str(e)})
     return out
+
+
+async def create_event(token: str, body: dict) -> dict:
+    """POST to /Crm/event (CRM write API)."""
+    import httpx, asyncio
+    base = os.getenv("REALNEX_API_BASE", "https://sync.realnex.com/api/v1/Crm").rstrip("/")
+    url = f"{base}/event"
+    headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.post(url, headers=headers, json=body)
+            return {"status": r.status_code, "url": url, "method": "POST", "request": {"json": body}, "response": r.json() if r.content else None}
+        except Exception as e:
+            return {"status": 599, "url": url, "method": "POST", "error": str(e), "request": {"json": body}}
