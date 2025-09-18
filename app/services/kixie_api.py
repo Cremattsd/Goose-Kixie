@@ -1,12 +1,6 @@
-# Activate
-source /opt/conda/bin/activate base
-
-# Replace the file completely
-cat > app/services/kixie_api.py <<'PY'
 from __future__ import annotations
 
 import os
-import json
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -14,13 +8,8 @@ import httpx
 
 # ───────────────────────── Config ─────────────────────────
 
-KIXIE_BASE = os.getenv("KIXIE_BASE_URL", "https://api.kixie.com").rstrip("/")
-
-KIXIE_CALLS_PATH = os.getenv("KIXIE_CALL_PATH", "/v1/calls").lstrip("/")
-KIXIE_WEBHOOK_LIST_PATH = os.getenv("KIXIE_WEBHOOK_LIST_PATH", "/v1/webhooks").lstrip("/")
-KIXIE_WEBHOOK_CREATE_PATH = os.getenv("KIXIE_WEBHOOK_CREATE_PATH", "/v1/webhooks").lstrip("/")
-KIXIE_WEBHOOK_DELETE_PATH = os.getenv("KIXIE_WEBHOOK_DELETE_PATH", "/v1/webhooks/{id}").lstrip("/")
-
+def _kx_base() -> str:
+    return os.getenv("KIXIE_BASE_URL", "https://api.kixie.com").rstrip("/")
 
 def _kx_headers(api_key: str, business_id: Optional[str] = None) -> Dict[str, str]:
     headers = {
@@ -91,8 +80,11 @@ async def _delete(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
 
 
 # ───────────────────────── Calls ─────────────────────────
+# We provide BOTH:
+#  - make_call_keys(...)  : requires key + business id
+#  - make_call(...)       : env-friendly wrapper (what the route imports)
 
-async def make_call(
+async def make_call_keys(
     key: str,
     bizid: str,
     agent_email: str,
@@ -101,10 +93,8 @@ async def make_call(
     caller_id: Optional[str] = None,
     from_number: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Kixie Make-a-Call with Business header + caller id support.
-    """
-    url = f"{KIXIE_BASE}/{KIXIE_CALLS_PATH}"
+    """Kixie Make-a-Call with Business header + caller id support."""
+    url = f"{_kx_base()}/{os.getenv('KIXIE_CALL_PATH', '/v1/calls').lstrip('/')}"
     body: Dict[str, Any] = {
         "business_id": bizid,
         "email": agent_email,
@@ -114,14 +104,12 @@ async def make_call(
     }
     if displayname:
         body["displayname"] = displayname
-
     # Optional caller-id/from
     if caller_id:
         body["caller_id"] = caller_id
         body.setdefault("from", caller_id)
     if from_number:
         body["from"] = from_number
-
     # Fallback to env caller-id if none provided
     if "from" not in body:
         env_caller = os.getenv("KIXIE_CALLER_ID")
@@ -130,6 +118,41 @@ async def make_call(
 
     headers = _kx_headers(key, bizid)
     return await _post(url, headers, body)
+
+async def make_call(
+    email: str,
+    target_e164: str,
+    displayname: Optional[str] = None,
+    api_key: Optional[str] = None,
+    business_id: Optional[str] = None,
+    caller_id: Optional[str] = None,
+    from_number: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Env-friendly wrapper that most routes call.
+    Falls back to KIXIE_API_KEY / KIXIE_BUSINESS_ID if not provided.
+    """
+    key = (api_key or os.getenv("KIXIE_API_KEY", "")).strip()
+    biz = (business_id or os.getenv("KIXIE_BUSINESS_ID", "")).strip()
+
+    if not key or not biz:
+        # Return a safe stub in dev if creds missing
+        return {
+            "status": 202,
+            "skipped": True,
+            "reason": "Kixie credentials not configured",
+            "echo": {"email": email, "target": target_e164, "displayname": displayname or target_e164},
+        }
+
+    return await make_call_keys(
+        key=key,
+        bizid=biz,
+        agent_email=email,
+        to=target_e164,
+        displayname=displayname,
+        caller_id=caller_id,
+        from_number=from_number,
+    )
 
 
 # ───────────────────────── Webhook Admin ─────────────────────────
@@ -149,11 +172,12 @@ def _normalize_listing_payload(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 async def list_webhooks(api_key: str, business_id: str) -> Dict[str, Any]:
-    url = f"{KIXIE_BASE}/{KIXIE_WEBHOOK_LIST_PATH}"
+    url = f"{_kx_base()}/{os.getenv('KIXIE_WEBHOOK_LIST_PATH', '/v1/webhooks').lstrip('/')}"
     return await _get(url, _kx_headers(api_key, business_id), params={"business_id": business_id})
 
 async def delete_webhook(api_key: str, business_id: str, webhook_id: str) -> Dict[str, Any]:
-    url = f"{KIXIE_BASE}/{KIXIE_WEBHOOK_DELETE_PATH.replace('{id}', str(webhook_id))}"
+    path = os.getenv("KIXIE_WEBHOOK_DELETE_PATH", "/v1/webhooks/{id}").lstrip("/").replace("{id}", str(webhook_id))
+    url = f"{_kx_base()}/{path}"
     return await _delete(url, _kx_headers(api_key, business_id))
 
 async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -189,8 +213,7 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
         if wid:
             await delete_webhook(api_key, business_id, wid)
 
-    url = f"{KIXIE_BASE}/{KIXIE_WEBHOOK_CREATE_PATH}"
+    url = f"{_kx_base()}/{os.getenv('KIXIE_WEBHOOK_CREATE_PATH', '/v1/webhooks').lstrip('/')}"
     body = dict(payload)
     body.setdefault("business_id", business_id)
     return await _post(url, _kx_headers(api_key, business_id), body)
-PY
