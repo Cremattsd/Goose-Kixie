@@ -5,12 +5,10 @@ import os
 from typing import Optional, Dict, Any, List
 import httpx
 
-
 # ───────────────────────── Config Helpers ─────────────────────────
 
 def _kx_base() -> str:
     return os.getenv("KIXIE_BASE_URL", "https://api.kixie.com").rstrip("/")
-
 
 def _kx_headers(api_key: str) -> Dict[str, str]:
     return {
@@ -19,7 +17,6 @@ def _kx_headers(api_key: str) -> Dict[str, str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-
 
 # ───────────────────────── Generic HTTP ─────────────────────────
 
@@ -41,7 +38,6 @@ async def _post(url: str, headers: Dict[str, str], json: Dict[str, Any]) -> Dict
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url, "request": {"json": json}}
 
-
 async def _get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -60,7 +56,6 @@ async def _get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url, "params": params or {}}
 
-
 async def _delete(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -77,7 +72,6 @@ async def _delete(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
             }
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url}
-
 
 # ───────────────────────── Click-to-Dial ─────────────────────────
 
@@ -137,7 +131,6 @@ if (locals().get("from_number") or caller_id):
 
     return await _post(url, headers, body)
 
-
 # ───────────────────────── Webhook Admin ─────────────────────────
 # NOTE: Kixie API shapes can vary by account; these endpoints/fields
 #       are written to be defensive and env-overridable.
@@ -149,7 +142,6 @@ def _webhook_paths() -> Dict[str, str]:
         # delete format string with {id}
         "delete": os.getenv("KIXIE_WEBHOOK_DELETE_PATH", "/v1/webhooks/{id}").lstrip("/"),
     }
-
 
 def _normalize_listing_payload(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -165,13 +157,11 @@ def _normalize_listing_payload(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
             return data.get(key)  # type: ignore[return-value]
     return []
 
-
 async def list_webhooks(api_key: str, business_id: str) -> Dict[str, Any]:
     base = _kx_base()
     url = f"{base}/{_webhook_paths()['list']}"
     # Some tenants require business_id as a param
     return await _get(url, _kx_headers(api_key), params={"business_id": business_id})
-
 
 async def delete_webhook(api_key: str, business_id: str, webhook_id: str) -> Dict[str, Any]:
     base = _kx_base()
@@ -179,7 +169,6 @@ async def delete_webhook(api_key: str, business_id: str, webhook_id: str) -> Dic
     url = f"{base}/{delete_path}"
     # business_id may not be required for delete, but keep headers consistent
     return await _delete(url, _kx_headers(api_key))
-
 
 async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -234,16 +223,8 @@ async def make_call(
     caller_id: str | None = None,
     from_number: str | None = None,
 ):
-    """
-    Kixie Make-a-Call
-
-    - Sends Authorization + X-API-KEY headers
-    - Adds X-Business-Id header
-    - Sends agent_email/user_email/email aliases
-    - If caller_id/from_number provided, sets body["from"] and body["caller_id"]
-    """
+    """Kixie Make-a-Call with Business header + caller id support."""
     url = "https://api.kixie.com/v1/calls"
-
     body = {
         "business_id": bizid,
         "email": agent_email,
@@ -253,15 +234,12 @@ async def make_call(
     }
     if displayname:
         body["displayname"] = displayname
-
-    # Optional caller ID / from
     if caller_id:
         body["caller_id"] = caller_id
-    if from_number or caller_id:
-        body["from"] = from_number or caller_id
-
+        body["from"] = caller_id
+    if from_number:
+        body["from"] = from_number
     headers = _kx_headers(key)
     if bizid:
         headers["X-Business-Id"] = bizid
-
     return await _post(url, headers, body)

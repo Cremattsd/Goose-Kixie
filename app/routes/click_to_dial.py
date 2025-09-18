@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
-from pydantic import BaseModel, Field, Field, Field
+from pydantic import BaseModel, Field, Field, Field, Field
 from sqlalchemy.orm import Session
 
 from ..services.db import get_db
@@ -43,6 +43,9 @@ class MakeCallBody(BaseModel):
     displayname: str | None = None
     caller_id: str | None = None
     from_: str | None = Field(default=None, alias='from')
+    class Config:
+        allow_population_by_field_name = True
+
     class Config:
         allow_population_by_field_name = True
 
