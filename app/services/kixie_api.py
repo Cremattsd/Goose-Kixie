@@ -224,3 +224,44 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
     # Many tenants require business_id field on creation
     body.setdefault("business_id", business_id)
     return await _post(url, _kx_headers(api_key), body)
+
+async def make_call(
+    key: str,
+    bizid: str,
+    agent_email: str,
+    to: str,
+    displayname: str | None = None,
+    caller_id: str | None = None,
+    from_number: str | None = None,
+):
+    """
+    Kixie Make-a-Call
+
+    - Sends Authorization + X-API-KEY headers
+    - Adds X-Business-Id header
+    - Sends agent_email/user_email/email aliases
+    - If caller_id/from_number provided, sets body["from"] and body["caller_id"]
+    """
+    url = "https://api.kixie.com/v1/calls"
+
+    body = {
+        "business_id": bizid,
+        "email": agent_email,
+        "agent_email": agent_email,
+        "user_email": agent_email,
+        "to": to,
+    }
+    if displayname:
+        body["displayname"] = displayname
+
+    # Optional caller ID / from
+    if caller_id:
+        body["caller_id"] = caller_id
+    if from_number or caller_id:
+        body["from"] = from_number or caller_id
+
+    headers = _kx_headers(key)
+    if bizid:
+        headers["X-Business-Id"] = bizid
+
+    return await _post(url, headers, body)

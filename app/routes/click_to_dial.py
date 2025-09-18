@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
-from pydantic import BaseModel, Field, Field
+from pydantic import BaseModel, Field, Field, Field
 from sqlalchemy.orm import Session
 
 from ..services.db import get_db
@@ -38,12 +38,14 @@ def _verify_goose_shared_secret(db: Session, request: Request) -> None:
 # ───────────────────────── Schemas ─────────────────────────
 
 class MakeCallBody(BaseModel):
-    agent_email: str = Field(..., description="Kixie user email to originate the call from")
-    phone: str = Field(..., description="Target phone (any format)")
-    displayname: Optional[str] = Field(None, description="Optional display name shown in Kixie")
-    call_id: Optional[str] = Field(None, min_length=2, max_length=64, description="Client-generated call id; if omitted we generate")
+    agent_email: str
+    phone: str
+    displayname: str | None = None
+    caller_id: str | None = None
+    from_: str | None = Field(default=None, alias='from')
+    class Config:
+        allow_population_by_field_name = True
 
-# ───────────────────────── Helpers ─────────────────────────
 
 async def _find_contact_key(token: str, e164: str) -> Optional[str]:
     # Try CRM-native search first
@@ -91,7 +93,7 @@ async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret:
     db.commit()
 
     # Fire Kixie event
-    kx = await make_call(email=body.agent_email, target_e164=target, displayname=body.displayname or target)
+    kx = await make_call(email=body.agent_email, target_e164=target, displayname=body.displayname or target, caller_id=body.caller_id, from_number=(body.from_ or body.caller_id))
 
     # Try to find CRM contact + return deeplink if template provided
     link: Optional[str] = None
