@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -66,7 +66,7 @@ async def _find_contact_key(token: str, e164: str) -> Optional[str]:
 # ───────────────────────── Endpoints ───────────────────────
 
 @router.post("/dialer/call/make")
-async def dialer_make_call(body: MakeCallBody, request: Request, db: Session = Depends(get_db)):
+async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret: Optional[str] = Header(None, alias=\"X-Goose-Secret\"), db: Session = Depends(get_db)):
     """
     Click-to-dial: triggers Kixie Make-a-Call, starts CallState timer,
     and returns an optional RealNex deep link if a contact match exists.

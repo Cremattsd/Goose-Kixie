@@ -396,7 +396,7 @@ def call_cleanup(older_than_minutes: int = Query(120, ge=1, le=1440), db: Sessio
 @router.post("/dialer/call/end")
 async def call_end(
     payload: KixieWebhook,
-    request: Request,
+    request: Request, x_goose_secret: Optional[str] = Header(None, alias=\"X-Goose-Secret\"),
     auto_tasks: Optional[bool] = Query(None, description="Override AUTO_TASKS_DEFAULT (true/false)"),
     x_user_tz: Optional[str] = Header(None, convert_underscores=False),
     db: Session = Depends(get_db),
@@ -465,7 +465,7 @@ async def call_end(
 @router.post("/webhooks/kixie")
 async def kixie_webhook(
     payload: KixieWebhook,
-    request: Request,
+    request: Request, x_goose_secret: Optional[str] = Header(None, alias=\"X-Goose-Secret\"),
     x_user_tz: Optional[str] = Header(None, convert_underscores=False),  # pass IANA tz like "America/Chicago"
     db: Session = Depends(get_db),
 ):
