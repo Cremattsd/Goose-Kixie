@@ -116,6 +116,12 @@ async def make_call(
         "to": target_e164,
         "displayname": displayname or target_e164,
     }
+# include optional caller id / from
+if caller_id:
+    body["caller_id"] = caller_id
+# prefer explicit from_number; else fall back to caller_id
+if (locals().get("from_number") or caller_id):
+    body["from"] = (from_number or caller_id)
         # Add optional caller ID if provided
     caller_id = os.getenv("KIXIE_CALLER_ID")
     if caller_id:

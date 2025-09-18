@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, Field
 from sqlalchemy.orm import Session
 
 from ..services.db import get_db
