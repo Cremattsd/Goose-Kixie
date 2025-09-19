@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
-from pydantic import BaseModel, Field, Field, Field, Field
+from pydantic import BaseModel, Field, ConfigDict, Field, Field, Field
 from sqlalchemy.orm import Session
 
 from ..services.db import get_db
@@ -38,6 +38,16 @@ def _verify_goose_shared_secret(db: Session, request: Request) -> None:
 # ───────────────────────── Schemas ─────────────────────────
 
 class MakeCallBody(BaseModel):
+    agent_email: str
+    phone: str  # E.164
+    displayname: str | None = None
+    caller_id: str | None = None
+    from_number: str | None = Field(default=None, alias="from")
+    call_id: str | None = None
+
+    # Pydantic v2: allow using field alias "from"
+    model_config = ConfigDict(populate_by_name=True)
+
     agent_email: str
     phone: str
     displayname: str | None = None
