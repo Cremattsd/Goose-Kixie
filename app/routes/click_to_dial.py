@@ -45,6 +45,16 @@ class MakeCallBody(BaseModel):
     from_number: str | None = Field(default=None, alias="from")
     call_id: str | None = None
 
+    # Pydantic v2: allow population by field name/alias
+    model_config = ConfigDict(populate_by_name=True)
+
+    agent_email: str
+    phone: str  # E.164
+    displayname: str | None = None
+    caller_id: str | None = None
+    from_number: str | None = Field(default=None, alias="from")
+    call_id: str | None = None
+
     # Pydantic v2: allow using field alias "from"
     model_config = ConfigDict(populate_by_name=True)
 
@@ -53,11 +63,9 @@ class MakeCallBody(BaseModel):
     displayname: str | None = None
     caller_id: str | None = None
     from_: str | None = Field(default=None, alias='from')
-    class Config:
-        allow_population_by_field_name = True
+    
 
-    class Config:
-        allow_population_by_field_name = True
+    
 
 
 async def _find_contact_key(token: str, e164: str) -> Optional[str]:
