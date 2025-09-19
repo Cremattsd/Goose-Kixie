@@ -1,3 +1,4 @@
+# app/services/kixie_api.py
 from __future__ import annotations
 
 import os
@@ -109,11 +110,26 @@ async def make_call(
     from_number: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Env-wrapper used by routes. Keeps the route signature stable:
-      make_call(agent_email=..., to=..., displayname=..., caller_id=..., from_number=...)
+    Env-wrapper used by routes.
+    make_call(agent_email=..., to=..., displayname=..., caller_id=..., from_number=...)
     """
+    # BYPASS for dev/testing
+    if os.getenv("KIXIE_BYPASS", "").strip() in {"1", "true", "yes"}:
+        return {
+            "status": 200,
+            "bypass": True,
+            "message": "KIXIE_BYPASS active—skipped remote call",
+            "request": {
+                "agent_email": agent_email,
+                "to": to,
+                "displayname": displayname or to,
+                "caller_id": caller_id,
+                "from": from_number or caller_id,
+            },
+        }
+
     api_key = os.getenv("KIXIE_API_KEY", "").strip()
-    biz_id = os.getenv("KIXIE_BUSINESS_ID", "").strip()
+    biz_id  = os.getenv("KIXIE_BUSINESS_ID", "").strip()
     from_number = from_number or os.getenv("KIXIE_CALLER_ID") or None
 
     if not api_key or not biz_id:
@@ -155,7 +171,7 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
     listing = await list_webhooks(api_key, business_id)
     items = _normalize_listing_payload(listing)
     desired_name = payload.get("name", "")
-    desired_loc = payload.get("location", "")
+    desired_loc  = payload.get("location", "")
 
     found = None
     for item in items:
@@ -178,7 +194,7 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
         if wid:
             await delete_webhook(api_key, business_id, wid)
 
-    url = f"{_kx_base()}/{_webhook_paths()['create']}"
+    url  = f"{_kx_base()}/{_webhook_paths()['create']}"
     body = dict(payload)
     body.setdefault("business_id", business_id)
     return await _post(url, _kx_headers(api_key), body)
