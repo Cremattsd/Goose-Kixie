@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
-from pydantic import BaseModel, Field, ConfigDict, Field, Field, Field
+from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
 
 from ..services.db import get_db
@@ -38,15 +38,19 @@ def _verify_goose_shared_secret(db: Session, request: Request) -> None:
 # ───────────────────────── Schemas ─────────────────────────
 
 class MakeCallBody(BaseModel):
+    # Pydantic v2: allow JSON alias names (so JSON key "from" maps to from_number)
     model_config = ConfigDict(populate_by_name=True)
 
     agent_email: str
     phone: str
-    displayname: str | None = None
-    caller_id: str | None = None
-    from_number: str | None = Field(default=None, alias="from")
-    call_id: str | None = None
+    displayname: Optional[str] = None
+    caller_id: Optional[str] = None
+    # Use a Python-safe field name, but accept JSON key "from"
+    from_number: Optional[str] = Field(default=None, alias="from")
+    # Optional client-provided ID; if absent we'll generate one
+    call_id: Optional[str] = None
 
+# ───────────────────────── Helpers ─────────────────────────
 
 async def _find_contact_key(token: str, e164: str) -> Optional[str]:
     # Try CRM-native search first
@@ -69,14 +73,19 @@ async def _find_contact_key(token: str, e164: str) -> Optional[str]:
 # ───────────────────────── Endpoints ───────────────────────
 
 @router.post("/dialer/call/make")
-async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret: Optional[str] = Header(None, alias="X-Goose-Secret"), db: Session = Depends(get_db)):
+async def dialer_make_call(
+    body: MakeCallBody,
+    request: Request,
+    x_goose_secret: Optional[str] = Header(None, alias="X-Goose-Secret"),
+    db: Session = Depends(get_db),
+):
     """
     Click-to-dial: triggers Kixie Make-a-Call, starts CallState timer,
     and returns an optional RealNex deep link if a contact match exists.
     """
     _verify_goose_shared_secret(db, request)
 
-    call_id = (getattr(body, 'call_id', None) or uuid4().hex[:16])
+    call_id = (body.call_id or uuid4().hex[:16])
     target = normalize_phone_e164ish(body.phone)
     if not target:
         raise HTTPException(400, "Invalid phone")
@@ -93,8 +102,17 @@ async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret:
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
 
+    # Prefer explicit from_number; else fall back to caller_id
+    from_num = body.from_number or body.caller_id
+
     # Fire Kixie event
-    kx = await make_call(email=body.agent_email, target_e164=target, displayname=body.displayname or target, caller_id=body.caller_id, from_number=(body.from_numbernumbernumber or body.caller_id))
+    kx = await make_call(
+        email=body.agent_email,
+        target_e164=target,
+        displayname=body.displayname or target,
+        caller_id=body.caller_id,
+        from_number=from_num,
+    )
 
     # Try to find CRM contact + return deeplink if template provided
     link: Optional[str] = None
