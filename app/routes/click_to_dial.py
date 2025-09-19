@@ -23,11 +23,13 @@ from ..services.links import contact_link
 
 router = APIRouter(tags=["dialer"])
 
+
 # ───────────────────────── Security ─────────────────────────
 
 def _verify_goose_shared_secret(db: Session, request: Request) -> None:
     rows = db.query(Tenant.id, Tenant.webhook_secret).all()
     if not rows:
+        # allow bootstrap before any tenant exists
         return
     provided = request.headers.get("X-Goose-Secret")
     if not provided:
@@ -35,25 +37,25 @@ def _verify_goose_shared_secret(db: Session, request: Request) -> None:
     if provided not in {r.webhook_secret for r in rows}:
         raise HTTPException(status_code=401, detail="Invalid X-Goose-Secret")
 
+
 # ───────────────────────── Schemas ─────────────────────────
 
 class MakeCallBody(BaseModel):
-    # Pydantic v2: allow JSON alias names (so JSON key "from" maps to from_number)
+    # Pydantic v2 config (no inner Config). Allow sending "from" in JSON.
     model_config = ConfigDict(populate_by_name=True)
 
     agent_email: str
     phone: str
     displayname: Optional[str] = None
     caller_id: Optional[str] = None
-    # Use a Python-safe field name, but accept JSON key "from"
     from_number: Optional[str] = Field(default=None, alias="from")
-    # Optional client-provided ID; if absent we'll generate one
     call_id: Optional[str] = None
+
 
 # ───────────────────────── Helpers ─────────────────────────
 
 async def _find_contact_key(token: str, e164: str) -> Optional[str]:
-    # Try CRM-native search first
+    # 1) Try native CRM search
     crm = await search_by_phone(token, e164)
     if int(crm.get("status", 0)) // 100 == 2:
         data = crm.get("data") or crm.get("value") or crm.get("items") or crm
@@ -64,13 +66,16 @@ async def _find_contact_key(token: str, e164: str) -> Optional[str]:
                     v = row.get(k)
                     if isinstance(v, str) and v:
                         return v
-    # Fallback: OData two-stage
+
+    # 2) Fallback: OData two-stage
     od = await search_contact_keys_by_phone_two_stage(token, e164)
     if int(od.get("status", 0)) // 100 == 2 and od.get("contactKey"):
         return str(od["contactKey"])
+
     return None
 
-# ───────────────────────── Endpoints ───────────────────────
+
+# ───────────────────────── Endpoints ─────────────────────────
 
 @router.post("/dialer/call/make")
 async def dialer_make_call(
@@ -85,7 +90,7 @@ async def dialer_make_call(
     """
     _verify_goose_shared_secret(db, request)
 
-    call_id = (body.call_id or uuid4().hex[:16])
+    call_id = body.call_id or uuid4().hex[:16]
     target = normalize_phone_e164ish(body.phone)
     if not target:
         raise HTTPException(400, "Invalid phone")
@@ -102,19 +107,16 @@ async def dialer_make_call(
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
 
-    # Prefer explicit from_number; else fall back to caller_id
-    from_num = body.from_number or body.caller_id
-
-    # Fire Kixie event
+    # Fire Kixie event (match your kixie_api.make_call signature)
     kx = await make_call(
-        email=body.agent_email,
-        target_e164=target,
-        displayname=body.displayname or target,
+        agent_email=body.agent_email,
+        to=target,
+        displayname=(body.displayname or target),
         caller_id=body.caller_id,
-        from_number=from_num,
+        from_number=(body.from_number or body.caller_id),
     )
 
-    # Try to find CRM contact + return deeplink if template provided
+    # Optional: try to find CRM contact and return deeplink
     link: Optional[str] = None
     token = get_rn_token()
     if token:
@@ -129,10 +131,9 @@ async def dialer_make_call(
         "contact_link": link,
     }
 
+
 @router.get("/contacts/{contact_key}/link")
 def contact_deeplink(contact_key: str):
-    """
-    Return a RealNex deep link for a contact using RN_CONTACT_URL_TEMPLATE.
-    """
+    """Return a RealNex deep link for a contact using RN_CONTACT_URL_TEMPLATE."""
     url = contact_link(contact_key)
     return {"contact_key": contact_key, "url": url}
