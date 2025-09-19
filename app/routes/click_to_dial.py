@@ -38,34 +38,15 @@ def _verify_goose_shared_secret(db: Session, request: Request) -> None:
 # ───────────────────────── Schemas ─────────────────────────
 
 class MakeCallBody(BaseModel):
-    agent_email: str
-    phone: str  # E.164
-    displayname: str | None = None
-    caller_id: str | None = None
-    from_number: str | None = Field(default=None, alias="from")
-    call_id: str | None = None
-
-    # Pydantic v2: allow population by field name/alias
-    model_config = ConfigDict(populate_by_name=True)
-
-    agent_email: str
-    phone: str  # E.164
-    displayname: str | None = None
-    caller_id: str | None = None
-    from_number: str | None = Field(default=None, alias="from")
-    call_id: str | None = None
-
-    # Pydantic v2: allow using field alias "from"
+    # pydantic v2: use model_config instead of inner Config
     model_config = ConfigDict(populate_by_name=True)
 
     agent_email: str
     phone: str
     displayname: str | None = None
     caller_id: str | None = None
-    from_: str | None = Field(default=None, alias='from')
-    
-
-    
+    from_number: str | None = Field(default=None, alias="from")
+    call_id: str | None = None
 
 
 async def _find_contact_key(token: str, e164: str) -> Optional[str]:
@@ -96,7 +77,7 @@ async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret:
     """
     _verify_goose_shared_secret(db, request)
 
-    call_id = body.call_id or uuid4().hex[:16]
+    call_id = (getattr(body, 'call_id', None) or uuid4().hex[:16])
     target = normalize_phone_e164ish(body.phone)
     if not target:
         raise HTTPException(400, "Invalid phone")
