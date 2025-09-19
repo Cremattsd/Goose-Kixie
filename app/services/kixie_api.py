@@ -2,101 +2,90 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Dict, Any, List
-
 import httpx
 
-
-# ───────────────────────── Config ─────────────────────────
-
+# ───────────────────────── Config Helpers ─────────────────────────
 def _kx_base() -> str:
     return os.getenv("KIXIE_BASE_URL", "https://api.kixie.com").rstrip("/")
 
 def _kx_headers(api_key: str, business_id: Optional[str] = None) -> Dict[str, str]:
-    headers = {
+    h = {
         "Authorization": f"Bearer {api_key}",
-        "X-API-KEY": api_key,  # some tenants require this
+        "X-API-KEY": api_key,   # many tenants require this
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
     if business_id:
-        headers["X-Business-Id"] = business_id
-    return headers
+        h["X-Business-Id"] = business_id
+    return h
 
-
-# ───────────────────────── HTTP helpers ─────────────────────────
-
-async def _post(url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> Dict[str, Any]:
+# ───────────────────────── Generic HTTP ─────────────────────────
+async def _post(url: str, headers: Dict[str, str], json: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(url, headers=headers, json=json_body)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text[:2000]}
-        return {
-            "status": r.status_code,
-            "url": str(r.request.url),
-            "method": r.request.method,
-            "request": {"json": json_body},
-            "response": data,
-        }
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, headers=headers, json=json)
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": r.text[:2000]}
+            return {
+                "status": r.status_code,
+                "url": str(r.request.url),
+                "method": r.request.method,
+                "request": {"json": json},
+                "response": data,
+            }
     except httpx.HTTPError as e:
-        return {"status": 599, "error": str(e), "url": url, "request": {"json": json_body}}
+        return {"status": 599, "error": str(e), "url": url, "request": {"json": json}}
 
 async def _get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(url, headers=headers, params=params or {})
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text[:2000]}
-        return {
-            "status": r.status_code,
-            "url": str(r.request.url),
-            "method": r.request.method,
-            "params": params or {},
-            "response": data,
-        }
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": r.text[:2000]}
+            return {
+                "status": r.status_code,
+                "url": str(r.request.url),
+                "method": r.request.method,
+                "params": params or {},
+                "response": data,
+            }
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url, "params": params or {}}
 
 async def _delete(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             r = await client.delete(url, headers=headers)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text[:2000]}
-        return {
-            "status": r.status_code,
-            "url": str(r.request.url),
-            "method": r.request.method,
-            "response": data,
-        }
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": r.text[:2000]}
+            return {
+                "status": r.status_code,
+                "url": str(r.request.url),
+                "method": r.request.method,
+                "response": data,
+            }
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url}
 
-
-# ───────────────────────── Calls ─────────────────────────
-# We provide BOTH:
-#  - make_call_keys(...)  : requires key + business id
-#  - make_call(...)       : env-friendly wrapper (what the route imports)
-
-async def make_call_keys(
-    key: str,
-    bizid: str,
+# ───────────────────────── Make-a-Call ─────────────────────────
+async def _make_call_with_key(
+    api_key: str,
+    business_id: str,
     agent_email: str,
     to: str,
     displayname: Optional[str] = None,
     caller_id: Optional[str] = None,
     from_number: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Kixie Make-a-Call with Business header + caller id support."""
     url = f"{_kx_base()}/{os.getenv('KIXIE_CALL_PATH', '/v1/calls').lstrip('/')}"
     body: Dict[str, Any] = {
-        "business_id": bizid,
+        "business_id": business_id,
         "email": agent_email,
         "agent_email": agent_email,
         "user_email": agent_email,
@@ -104,65 +93,48 @@ async def make_call_keys(
     }
     if displayname:
         body["displayname"] = displayname
-    # Optional caller-id/from
     if caller_id:
         body["caller_id"] = caller_id
         body.setdefault("from", caller_id)
     if from_number:
         body["from"] = from_number
-    # Fallback to env caller-id if none provided
-    if "from" not in body:
-        env_caller = os.getenv("KIXIE_CALLER_ID")
-        if env_caller:
-            body["from"] = env_caller
 
-    headers = _kx_headers(key, bizid)
-    return await _post(url, headers, body)
+    return await _post(url, _kx_headers(api_key, business_id), body)
 
 async def make_call(
-    email: str,
-    target_e164: str,
+    agent_email: str,
+    to: str,
     displayname: Optional[str] = None,
-    api_key: Optional[str] = None,
-    business_id: Optional[str] = None,
     caller_id: Optional[str] = None,
     from_number: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Env-friendly wrapper that most routes call.
-    Falls back to KIXIE_API_KEY / KIXIE_BUSINESS_ID if not provided.
+    Env-wrapper used by routes. Keeps the route signature stable:
+      make_call(agent_email=..., to=..., displayname=..., caller_id=..., from_number=...)
     """
-    key = (api_key or os.getenv("KIXIE_API_KEY", "")).strip()
-    biz = (business_id or os.getenv("KIXIE_BUSINESS_ID", "")).strip()
+    api_key = os.getenv("KIXIE_API_KEY", "").strip()
+    biz_id = os.getenv("KIXIE_BUSINESS_ID", "").strip()
+    from_number = from_number or os.getenv("KIXIE_CALLER_ID") or None
 
-    if not key or not biz:
-        # Return a safe stub in dev if creds missing
+    if not api_key or not biz_id:
         return {
             "status": 202,
             "skipped": True,
             "reason": "Kixie credentials not configured",
-            "echo": {"email": email, "target": target_e164, "displayname": displayname or target_e164},
+            "echo": {"email": agent_email, "target": to, "displayname": displayname or to},
         }
 
-    return await make_call_keys(
-        key=key,
-        bizid=biz,
-        agent_email=email,
-        to=target_e164,
-        displayname=displayname,
-        caller_id=caller_id,
-        from_number=from_number,
-    )
-
+    return await _make_call_with_key(api_key, biz_id, agent_email, to, displayname, caller_id, from_number)
 
 # ───────────────────────── Webhook Admin ─────────────────────────
+def _webhook_paths() -> Dict[str, str]:
+    return {
+        "list": os.getenv("KIXIE_WEBHOOK_LIST_PATH", "/v1/webhooks").lstrip("/"),
+        "create": os.getenv("KIXIE_WEBHOOK_CREATE_PATH", "/v1/webhooks").lstrip("/"),
+        "delete": os.getenv("KIXIE_WEBHOOK_DELETE_PATH", "/v1/webhooks/{id}").lstrip("/"),
+    }
 
 def _normalize_listing_payload(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Return a simple list of webhook dicts from an arbitrary listing payload.
-    Accepts shapes like:
-      { "webhooks": [...] } or { "data": [...] } or { "items": [...] } or [...]
-    """
     data = resp.get("response", {})
     if isinstance(data, list):
         return data
@@ -172,21 +144,14 @@ def _normalize_listing_payload(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 async def list_webhooks(api_key: str, business_id: str) -> Dict[str, Any]:
-    url = f"{_kx_base()}/{os.getenv('KIXIE_WEBHOOK_LIST_PATH', '/v1/webhooks').lstrip('/')}"
-    return await _get(url, _kx_headers(api_key, business_id), params={"business_id": business_id})
+    url = f"{_kx_base()}/{_webhook_paths()['list']}"
+    return await _get(url, _kx_headers(api_key), params={"business_id": business_id})
 
 async def delete_webhook(api_key: str, business_id: str, webhook_id: str) -> Dict[str, Any]:
-    path = os.getenv("KIXIE_WEBHOOK_DELETE_PATH", "/v1/webhooks/{id}").lstrip("/").replace("{id}", str(webhook_id))
-    url = f"{_kx_base()}/{path}"
-    return await _delete(url, _kx_headers(api_key, business_id))
+    url = f"{_kx_base()}/{_webhook_paths()['delete'].replace('{id}', str(webhook_id))}"
+    return await _delete(url, _kx_headers(api_key))
 
 async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Idempotent-ish create:
-      - list existing webhooks
-      - if one with same name exists and location matches => noop
-      - else delete and create
-    """
     listing = await list_webhooks(api_key, business_id)
     items = _normalize_listing_payload(listing)
     desired_name = payload.get("name", "")
@@ -213,7 +178,7 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
         if wid:
             await delete_webhook(api_key, business_id, wid)
 
-    url = f"{_kx_base()}/{os.getenv('KIXIE_WEBHOOK_CREATE_PATH', '/v1/webhooks').lstrip('/')}"
+    url = f"{_kx_base()}/{_webhook_paths()['create']}"
     body = dict(payload)
     body.setdefault("business_id", business_id)
-    return await _post(url, _kx_headers(api_key, business_id), body)
+    return await _post(url, _kx_headers(api_key), body)
