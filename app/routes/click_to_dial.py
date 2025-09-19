@@ -94,7 +94,7 @@ async def dialer_make_call(body: MakeCallBody, request: Request, x_goose_secret:
     db.commit()
 
     # Fire Kixie event
-    kx = await make_call(email=body.agent_email, target_e164=target, displayname=body.displayname or target, caller_id=body.caller_id, from_number=(body.from_numbernumber or body.caller_id))
+    kx = await make_call(email=body.agent_email, target_e164=target, displayname=body.displayname or target, caller_id=body.caller_id, from_number=(body.from_numbernumbernumber or body.caller_id))
 
     # Try to find CRM contact + return deeplink if template provided
     link: Optional[str] = None
