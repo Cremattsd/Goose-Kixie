@@ -1,4 +1,3 @@
-# app/schemas/kixie.py
 from __future__ import annotations
 
 from typing import Optional, Literal
@@ -11,13 +10,11 @@ from pydantic import (
     ConfigDict,
     AliasChoices,
 )
+import re
 
 
 def _to_utc_ms(dt: Optional[datetime], assume_tz: Optional[timezone] = None) -> Optional[str]:
-    """
-    Return ISO8601 in UTC (millisecond precision).
-    If dt is naive, attach assume_tz (if provided) or UTC.
-    """
+    """Return ISO8601 in UTC (ms precision). If dt is naive, attach assume_tz or UTC."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -26,12 +23,15 @@ def _to_utc_ms(dt: Optional[datetime], assume_tz: Optional[timezone] = None) -> 
 
 
 class KixieWebhook(BaseModel):
-    """
-    Canonical Kixie webhook payload (tolerant and future-proof).
-    """
+    """Canonical Kixie webhook payload (tolerant and future-proof)."""
     model_config = ConfigDict(extra="ignore")  # ignore unexpected/extra keys
 
-    event: str = Field(default="call.completed", description="Kixie event type")
+    # Accept both "event" and "eventname"
+    event: str = Field(
+        default="endcall",
+        description="Kixie event type (e.g., endcall, disposition, SMS)",
+        validation_alias=AliasChoices("event", "eventname", "eventName", "type"),
+    )
     direction: Literal["outbound", "inbound"] = "outbound"
 
     from_number: Optional[str] = Field(
@@ -96,12 +96,14 @@ class KixieWebhook(BaseModel):
         if isinstance(v, datetime):
             return v
 
-        # Numeric epoch?
         if isinstance(v, (int, float)):
             # Heuristic: treat large numbers as ms
             if v > 10**12:
                 v = v / 1000.0
-            return datetime.fromtimestamp(v, tz=timezone.utc)
+            try:
+                return datetime.fromtimestamp(v, tz=timezone.utc)
+            except Exception:
+                return None
 
         if isinstance(v, str):
             s = v.strip()
@@ -113,7 +115,14 @@ class KixieWebhook(BaseModel):
             # Trailing Z → explicit +00:00
             if s.endswith("Z"):
                 s = s[:-1] + "+00:00"
-            return datetime.fromisoformat(s)
+            # Try parse, then a lenient retry
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                try:
+                    return datetime.fromisoformat(re.sub(r"Z$", "+00:00", s))
+                except Exception:
+                    return None
 
         return v  # let Pydantic try (unlikely)
 
@@ -121,7 +130,7 @@ class KixieWebhook(BaseModel):
     @classmethod
     def _coerce_duration(cls, v):
         """
-        Accept strings; ignore 'ms' vs 's' units here—route can normalize if needed.
+        Accept strings ('93', '93.0', '00:01:33'); be forgiving about ms.
         """
         if v in (None, ""):
             return 0
@@ -129,6 +138,10 @@ class KixieWebhook(BaseModel):
             v = v.strip()
             if not v:
                 return 0
+            # HH:MM:SS
+            if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", v):
+                h, m, s = (int(x) for x in v.split(":"))
+                return h * 3600 + m * 60 + s
             # best-effort parse integer-like strings
             try:
                 v = int(float(v))
@@ -141,6 +154,28 @@ class KixieWebhook(BaseModel):
         except Exception:
             pass
         return int(v)
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _norm_direction(cls, v):
+        if v is None:
+            return "outbound"
+        s = str(v).strip().lower()
+        if s in {"outgoing", "outbound"}:
+            return "outbound"
+        if s in {"incoming", "inbound"}:
+            return "inbound"
+        return "outbound"
+
+    @field_validator("from_number", "to_number", mode="before")
+    @classmethod
+    def _sanitize_phone(cls, v):
+        if v in (None, ""):
+            return None
+        s = str(v).strip()
+        lead_plus = s.startswith("+")
+        digits = re.sub(r"\D", "", s)
+        return f"+{digits}" if lead_plus else digits or None
 
     @model_validator(mode="after")
     def _validate_times(self):
