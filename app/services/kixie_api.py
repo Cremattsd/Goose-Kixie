@@ -1,18 +1,20 @@
+cat > app/services/kixie_api.py <<'PY'
 from __future__ import annotations
 
-import os
+import os, json
 from typing import Optional, Dict, Any, List
 import httpx
 
-# ───────────────────────── Config Helpers ─────────────────────────
+# ───────────────────────── Bases ─────────────────────────
 def _kx_base() -> str:
-    """Classic REST base used for calls (unchanged)."""
+    """Legacy REST base (still used for /v1/calls)."""
     return os.getenv("KIXIE_BASE_URL", "https://api.kixie.com").rstrip("/")
 
 def _apig_base() -> str:
-    """New APIG base used for webhooks admin."""
+    """New APIG base for webhook admin."""
     return os.getenv("KIXIE_APIG_BASE_URL", "https://apig.kixie.com/app/v1/api").rstrip("/")
 
+# ───────────────────────── Headers ─────────────────────────
 def _kx_headers(api_key: str, business_id: Optional[str] = None) -> Dict[str, str]:
     h = {
         "Authorization": f"Bearer {api_key}",
@@ -23,6 +25,12 @@ def _kx_headers(api_key: str, business_id: Optional[str] = None) -> Dict[str, st
     if business_id:
         h["X-Business-Id"] = business_id
     return h
+
+def _apig_headers() -> Dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
 # ───────────────────────── Generic HTTP ─────────────────────────
 async def _post(url: str, headers: Dict[str, str], json: Dict[str, Any]) -> Dict[str, Any]:
@@ -78,7 +86,7 @@ async def _delete(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url}
 
-# ───────────────────────── Calls ─────────────────────────
+# ───────────────────────── Make-a-Call (legacy /v1/calls) ─────────────────────────
 async def _make_call_with_key(
     api_key: str,
     business_id: str,
@@ -146,81 +154,83 @@ async def make_call(
 
     return await _make_call_with_key(api_key, biz_id, agent_email, to, displayname, caller_id, from_number)
 
-# ───────────────────────── Webhook Admin via APIG ─────────────────────────
-async def apig_get_webhooks(api_key: str, business_id: str) -> Dict[str, Any]:
+# ───────────────────────── APIG Webhook Admin ─────────────────────────
+def _normalize_listing_payload(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = resp.get("response") or resp.get("data") or resp
+    if isinstance(data, list):
+        return data
+    for key in ("result", "webhooks", "data", "items", "value"):
+        v = data.get(key) if isinstance(data, dict) else None
+        if isinstance(v, list):
+            return v
+    return []
+
+async def list_webhooks(api_key: str, business_id: str) -> Dict[str, Any]:
+    """Compatibility shim: returns APIG getWebhooks response."""
     url = f"{_apig_base()}/getWebhooks"
     body = {"apikey": api_key, "businessid": business_id, "call": "getWebhooks"}
-    # APIG expects JSON body (no bearer header)
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(url, json=body, headers={"Content-Type": "application/json"})
-            data = r.json() if r.content else {}
-            return {"status": r.status_code, "url": url, "method": "POST", "request": {"json": body}, "response": data}
-    except httpx.HTTPError as e:
-        return {"status": 599, "url": url, "error": str(e), "request": {"json": body}}
+    return await _post(url, _apig_headers(), body)
 
-async def apig_post_webhook(
-    api_key: str,
-    business_id: str,
-    eventname: str,
-    location: str,
-    name: str,
-    secret: str,
-) -> Dict[str, Any]:
-    url = f"{_apig_base()}/postwebhook"
-    headers_json = f'[{{"name": "X-Goose-Secret", "value": "{secret}"}}]'
+async def delete_webhook(api_key: str, business_id: str, webhook_id: str | int) -> Dict[str, Any]:
+    """Compatibility shim: APIG deletewebhook call."""
+    url = f"{_apig_base()}/deletewebhook"
+    body = {"apikey": api_key, "businessid": business_id, "call": "deletewebhook", "webhookid": int(webhook_id)}
+    return await _post(url, _apig_headers(), body)
+
+async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure a webhook exists in APIG. If a webhook with the same name exists:
+      - If location matches → noop
+      - Else delete and recreate
+    Expected payload keys (APIG): eventname, direction, callresult, disposition, runtime, name, location, headers(list or stringified), business_id optional
+    """
+    # list existing
+    listing = await list_webhooks(api_key, business_id)
+    items = _normalize_listing_payload(listing)
+    desired_name = payload.get("name", "")
+    desired_loc  = payload.get("location", "")
+
+    found = None
+    for item in items:
+        nm = item.get("name") or item.get("webhookname") or ""
+        if nm == desired_name:
+            found = item
+            break
+
+    if found:
+        wid = str(found.get("webhookid") or found.get("id") or "")
+        loc = found.get("webhookLocation") or found.get("location") or found.get("url") or ""
+        if wid and str(loc).strip() == str(desired_loc).strip():
+            return {
+                "status": 200,
+                "action": "noop",
+                "reason": "matching webhook already present",
+                "webhook": {"id": wid, "name": desired_name, "location": loc},
+                "listing_status": listing.get("status"),
+            }
+        if wid:
+            await delete_webhook(api_key, business_id, wid)
+
+    # create
+    url  = f"{_apig_base()}/postwebhook"
     body = {
         "apikey": api_key,
         "businessid": business_id,
         "call": "postWebhook",
-        "eventname": eventname,
-        "direction": "all",
-        "callresult": "all",
-        "disposition": "all",
-        "runtime": "realtime",
-        "name": name,
-        "location": location,
-        "headers": headers_json,
+        "eventname": payload.get("eventname") or payload.get("event"),
+        "direction": payload.get("direction", "all"),
+        "callresult": payload.get("callresult", "all"),
+        "disposition": payload.get("disposition", "all"),
+        "runtime": payload.get("runtime", "realtime"),
+        "name": desired_name,
+        "location": desired_loc,
     }
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(url, json=body, headers={"Content-Type": "application/json"})
-            data = r.json() if r.content else {}
-            return {"status": r.status_code, "url": url, "method": "POST", "request": {"json": body}, "response": data}
-    except httpx.HTTPError as e:
-        return {"status": 599, "url": url, "error": str(e), "request": {"json": body}}
+    # headers: APIG accepts a stringified JSON array in many tenants
+    hdrs = payload.get("headers")
+    if isinstance(hdrs, list):
+        body["headers"] = json.dumps(hdrs)
+    elif isinstance(hdrs, str):
+        body["headers"] = hdrs
 
-async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Idempotently ensure a webhook on APIG. We don't try to delete on dup—APIG
-    returns an ER_DUP_ENTRY we can treat as success/noop.
-    """
-    desired_name = payload.get("name", "")
-    desired_loc  = payload.get("location", "")
-    eventname    = payload.get("eventname") or payload.get("event") or payload.get("event_name") or ""
-    secret       = payload.get("secret") or payload.get("webhook_secret") or ""
-
-    # First, see what's there (useful for debug/log)
-    listing = await apig_get_webhooks(api_key, business_id)
-
-    # Create/ensure
-    resp = await apig_post_webhook(api_key, business_id, eventname, desired_loc, desired_name, secret)
-
-    # Treat duplicate as success
-    ok = int(resp.get("status", 0)) // 100 == 2
-    if not ok:
-        # Some APIG returns 200 but success:false with ER_DUP_ENTRY.
-        res_body = resp.get("response") or {}
-        if isinstance(res_body, dict) and res_body.get("success") is False:
-            inner = res_body.get("result") or {}
-            if isinstance(inner, dict) and str(inner.get("code")) == "ER_DUP_ENTRY":
-                ok = True
-
-    return {
-        "status": resp.get("status"),
-        "action": "ensure",
-        "ok": ok,
-        "request": resp.get("request"),
-        "response": resp.get("response"),
-        "listing_status": listing.get("status"),
-    }
+    return await _post(url, _apig_headers(), body)
+PY
