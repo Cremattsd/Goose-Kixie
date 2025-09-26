@@ -1,5 +1,6 @@
-cat > app/services/kixie_api.py <<'PY'
 from __future__ import annotations
+
+cat > app/services/kixie_api.py <<'PY'
 
 import os, json
 from typing import Optional, Dict, Any, List
