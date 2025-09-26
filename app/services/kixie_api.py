@@ -1,4 +1,3 @@
-cat > app/services/kixie_api.py <<'PY'
 from __future__ import annotations
 
 import os
@@ -23,8 +22,8 @@ def _kx_headers(api_key: str, business_id: Optional[str] = None) -> Dict[str, st
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    # Some tenants expect a business id header name variant
     if business_id:
+        # Some tenants expect a business id header name variant
         h["X-Kixie-Business-Id"] = str(business_id)
     return h
 
@@ -35,7 +34,12 @@ def _apig_headers() -> Dict[str, str]:
     }
 
 # ───────────────────────── Generic HTTP ─────────────────────────
-async def _format_resp(r: httpx.Response, *, request_json: Dict[str, Any] | None = None, request_params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+async def _format_resp(
+    r: httpx.Response,
+    *,
+    request_json: Dict[str, Any] | None = None,
+    request_params: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
     try:
         data = r.json() if r.content else {}
     except Exception:
@@ -227,4 +231,3 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
         body["headers"] = hdrs
 
     return await _post(url, _apig_headers(), body)
-PY
