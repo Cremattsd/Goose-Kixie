@@ -1,4 +1,3 @@
-# app/services/realnex_api.py
 from __future__ import annotations
 
 import os, re, base64, asyncio, httpx, json
@@ -87,7 +86,7 @@ def normalize_phone_e164ish(raw: Optional[str]) -> Optional[str]:
         return f"+1{digits}"
     if digits.startswith("1") and len(digits) == 11:
         return f"+{digits}"
-    if raw.startswith("+"):
+    if str(raw).startswith("+"):
         return f"+{digits}"
     return f"+{digits}"
 
@@ -96,6 +95,10 @@ def digits_only(raw: Optional[str]) -> Optional[str]:
         return None
     d = re.sub(r"\D+", "", raw)
     return d or None
+
+def last10(raw: Optional[str]) -> Optional[str]:
+    d = digits_only(raw) or ""
+    return d[-10:] if len(d) >= 10 else (d or None)
 
 def _like_phone_name(name: str) -> bool:
     n = name.lower()
@@ -141,15 +144,34 @@ def _passes_dnc(row: Dict[str, Any], matched_fields: Set[str], dnc_fields: Dict[
 
 # ─────────────── CRM: Contacts, History, Tasks ───────────────
 
-async def search_by_phone(token: str, phone_e164: str) -> Dict[str, Any]:
+async def search_by_phone(token: str, phone_e164_or_raw: str) -> Dict[str, Any]:
+    # Try E.164 first
+    e164 = normalize_phone_e164ish(phone_e164_or_raw) or phone_e164_or_raw
     resp = await _try_paths(
         "GET",
         ["Contacts/search", "Contact/search", "contacts/search", "contact/search"],
         token,
-        params={"phone": phone_e164},
+        params={"phone": e164},
     )
     if int(resp.get("status", 0)) // 100 == 2:
         return resp
+
+    # Fallbacks: raw digits, then last-10
+    raw_digits = digits_only(phone_e164_or_raw) or ""
+    lt10 = last10(phone_e164_or_raw) or ""
+    for variant in (raw_digits, lt10):
+        if not variant:
+            continue
+        alt = await _try_paths(
+            "GET",
+            ["Contacts/search", "Contact/search", "contacts/search", "contact/search"],
+            token,
+            params={"phone": variant},
+        )
+        if int(alt.get("status", 0)) // 100 == 2:
+            alt["fallback_used"] = variant
+            return alt
+
     return {"status": resp.get("status", 400), "error": "crm_search_failed", "raw": resp}
 
 async def create_contact(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -584,6 +606,8 @@ async def search_contact_keys_by_phone_two_stage(token: str, phone_raw: str) -> 
 
 async def search_contact_key_by_phone_auto(token: str, phone_raw: str) -> Tuple[Optional[str], Dict[str, Any]]:
     e164 = normalize_phone_e164ish(phone_raw) or phone_raw
+
+    # 1) CRM search (now includes fallbacks under the hood)
     std = await search_by_phone(token, e164)
     for container in ("data","value","items"):
         items = std.get(container)
@@ -593,9 +617,13 @@ async def search_contact_key_by_phone_auto(token: str, phone_raw: str) -> Tuple[
                 for k in ("Key","key","Id","id","ContactKey","contactKey"):
                     if k in first and first[k]:
                         return str(first[k]), {"stage": "crm_search", "resp": std}
+
+    # 2) Two-stage OData → detail confirm
     ts = await search_contact_keys_by_phone_two_stage(token, e164)
     if int(ts.get("status", 0)) // 100 == 2 and ts.get("contactKey"):
         return str(ts["contactKey"]), {"stage": "odata_two_stage", "resp": ts}
+
+    # 3) Wide OData → first key
     wide = await search_contact_by_phone_wide(token, e164)
     vals = wide.get("value") or wide.get("data") or []
     if isinstance(vals, list) and vals:
@@ -603,6 +631,7 @@ async def search_contact_key_by_phone_auto(token: str, phone_raw: str) -> Tuple[
         for k in ("Key","key","Id","id","ContactKey","contactKey"):
             if k in first and first[k]:
                 return str(first[k]), {"stage": "odata_wide", "resp": wide}
+
     return None, {"stage": "not_found", "resp": {"std": std, "two_stage": ts, "wide": wide}}
 
 # ─────────────── Attachments ───────────────
