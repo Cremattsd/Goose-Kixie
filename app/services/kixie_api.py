@@ -1,8 +1,8 @@
+cat > app/services/kixie_api.py <<'PY'
 from __future__ import annotations
 
-cat > app/services/kixie_api.py <<'PY'
-
-import os, json
+import os
+import json
 from typing import Optional, Dict, Any, List
 import httpx
 
@@ -23,8 +23,9 @@ def _kx_headers(api_key: str, business_id: Optional[str] = None) -> Dict[str, st
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    # Some tenants expect a business id header name variant
     if business_id:
-        h["X-Business-Id"] = business_id
+        h["X-Kixie-Business-Id"] = str(business_id)
     return h
 
 def _apig_headers() -> Dict[str, str]:
@@ -34,56 +35,44 @@ def _apig_headers() -> Dict[str, str]:
     }
 
 # ───────────────────────── Generic HTTP ─────────────────────────
-async def _post(url: str, headers: Dict[str, str], json: Dict[str, Any]) -> Dict[str, Any]:
+async def _format_resp(r: httpx.Response, *, request_json: Dict[str, Any] | None = None, request_params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(url, headers=headers, json=json)
-            try:
-                data = r.json()
-            except Exception:
-                data = {"raw": r.text[:2000]}
-            return {
-                "status": r.status_code,
-                "url": str(r.request.url),
-                "method": r.request.method,
-                "request": {"json": json},
-                "response": data,
-            }
+        data = r.json() if r.content else {}
+    except Exception:
+        data = {"raw": (await r.aread()).decode("utf-8", "ignore")[:2000]}
+    out: Dict[str, Any] = {
+        "status": r.status_code,
+        "url": str(r.request.url),
+        "method": r.request.method,
+        "response": data,
+    }
+    if request_json is not None:
+        out["request"] = {"json": request_json}
+    if request_params is not None:
+        out["params"] = request_params
+    return out
+
+async def _post(url: str, headers: Dict[str, str], json_body: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.post(url, headers=headers, json=json_body)
+            return await _format_resp(r, request_json=json_body)
     except httpx.HTTPError as e:
-        return {"status": 599, "error": str(e), "url": url, "request": {"json": json}}
+        return {"status": 599, "error": str(e), "url": url, "request": {"json": json_body}}
 
 async def _get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             r = await client.get(url, headers=headers, params=params or {})
-            try:
-                data = r.json()
-            except Exception:
-                data = {"raw": r.text[:2000]}
-            return {
-                "status": r.status_code,
-                "url": str(r.request.url),
-                "method": r.request.method,
-                "params": params or {},
-                "response": data,
-            }
+            return await _format_resp(r, request_params=params or {})
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url, "params": params or {}}
 
 async def _delete(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             r = await client.delete(url, headers=headers)
-            try:
-                data = r.json()
-            except Exception:
-                data = {"raw": r.text[:2000]}
-            return {
-                "status": r.status_code,
-                "url": str(r.request.url),
-                "method": r.request.method,
-                "response": data,
-            }
+            return await _format_resp(r)
     except httpx.HTTPError as e:
         return {"status": 599, "error": str(e), "url": url}
 
@@ -97,7 +86,8 @@ async def _make_call_with_key(
     caller_id: Optional[str] = None,
     from_number: Optional[str] = None,
 ) -> Dict[str, Any]:
-    url = f"{_kx_base()}/{os.getenv('KIXIE_CALL_PATH', '/v1/calls').lstrip('/')}"
+    call_path = os.getenv("KIXIE_CALL_PATH", "/v1/calls").lstrip("/")
+    url = f"{_kx_base()}/{call_path}"
     body: Dict[str, Any] = {
         "business_id": business_id,
         "email": agent_email,
@@ -173,7 +163,7 @@ async def list_webhooks(api_key: str, business_id: str) -> Dict[str, Any]:
     return await _post(url, _apig_headers(), body)
 
 async def delete_webhook(api_key: str, business_id: str, webhook_id: str | int) -> Dict[str, Any]:
-    """Compatibility shim: APIG deletewebhook call."""
+    """Compatibility shim: APIG deletewebhook call by id."""
     url = f"{_apig_base()}/deletewebhook"
     body = {"apikey": api_key, "businessid": business_id, "call": "deletewebhook", "webhookid": int(webhook_id)}
     return await _post(url, _apig_headers(), body)
@@ -183,9 +173,12 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
     Ensure a webhook exists in APIG. If a webhook with the same name exists:
       - If location matches → noop
       - Else delete and recreate
-    Expected payload keys (APIG): eventname, direction, callresult, disposition, runtime, name, location, headers(list or stringified), business_id optional
+
+    Expected payload keys (APIG):
+      eventname, direction, callresult, disposition, runtime, name, location,
+      headers (list or stringified), business_id optional
     """
-    # list existing
+    # 1) list existing
     listing = await list_webhooks(api_key, business_id)
     items = _normalize_listing_payload(listing)
     desired_name = payload.get("name", "")
@@ -212,7 +205,7 @@ async def create_or_update_webhook(api_key: str, business_id: str, payload: Dict
         if wid:
             await delete_webhook(api_key, business_id, wid)
 
-    # create
+    # 2) create (APIG postwebhook)
     url  = f"{_apig_base()}/postwebhook"
     body = {
         "apikey": api_key,
